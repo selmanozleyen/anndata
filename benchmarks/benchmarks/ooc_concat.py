@@ -63,7 +63,7 @@ def read_dask(store):
     return adata
 
 
-class CsrAxis0Suite(WriteSuiteBase, FuncSuiteBase):
+class ByArrayTypeSuite(WriteSuiteBase, FuncSuiteBase):
     params = [
         ("csrs", "nps-0", "nps-1", "cscs"),
     ]
