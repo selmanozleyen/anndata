@@ -6,6 +6,7 @@ import tempfile
 import glob, os
 import anndata
 from anndata._io.merge import concat_on_disk
+from anndata._core.merge import concat 
 import dask.array as da
 import zarr
 
@@ -33,12 +34,20 @@ class WriteSuiteBase(NoSetup):
         self.tmpdir.cleanup()
 
 
-class FuncSuiteBase(NoSetup):
+class ConcatOnDisk(NoSetup):
     def time_func_full(self, *args, **kwargs):
         concat_on_disk(self.filepaths, self.writepth, axis=self.axis)
 
     def peakmem_func_full(self, *args, **kwargs):
         concat_on_disk(self.filepaths, self.writepth, axis=self.axis)
+
+
+class Concat(NoSetup):
+    def time_func_full(self, *args, **kwargs):
+        concat([anndata.read_zarr(fp) for fp in self.filepaths], axis=self.axis)
+
+    def peakmem_func_full(self, *args, **kwargs):
+        concat([anndata.read_zarr(fp) for fp in self.filepaths], axis=self.axis)
 
 
 def read_dask(store):
@@ -63,7 +72,38 @@ def read_dask(store):
     return adata
 
 
-class ByArrayTypeSuite(WriteSuiteBase, FuncSuiteBase):
+class ByArrayTypeConcatOnDiskSuite(WriteSuiteBase, ConcatOnDisk):
+    params = [
+        ("csrs", "nps-0", "nps-1", "cscs"),
+    ]
+    param_names = ["fileset"]
+
+    def setup(self, fileset):
+        if "csrs" in fileset:
+            self.filepaths = CSRS
+            self.axis = 0
+        elif "nps" in fileset:
+            self.filepaths = NPS
+            if "0" in fileset:
+                self.axis = 0
+            elif "1" in fileset:
+                self.axis = 1
+        elif fileset == "cscs":
+            self.filepaths = CSCS
+            self.axis = 1
+
+        if self.axis == 0:
+            self.filepaths = self.filepaths.intersection(FATS.union(SQUARES))
+        elif self.axis == 1:
+            self.filepaths = self.filepaths.intersection(TALLS.union(SQUARES))
+
+        self._setup()
+
+    def teardown(self, *args, **kwargs):
+        self._teardown()
+
+
+class ByArrayTypeConcatSuite(WriteSuiteBase, Concat):
     params = [
         ("csrs", "nps-0", "nps-1", "cscs"),
     ]
