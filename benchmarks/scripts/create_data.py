@@ -7,7 +7,7 @@ import zarr
 import anndata
 
 shapes = ["fat", "tall", "square"]
-sizes = [1_000]
+sizes = [10_000]
 densities = [0.1, 1]
 NUM_RUNS = 3
 
@@ -68,7 +68,7 @@ if __name__ == "__main__":
                         M = size
                         N = size
                         if shape != "square":
-                            other_size = int(size * np.random.uniform(0.4, 0.9))
+                            other_size = int(size * np.random.uniform(0.7, 0.9))
                             if shape == "fat":
                                 M = other_size
                             elif shape == "tall":
