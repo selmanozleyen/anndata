@@ -1,16 +1,14 @@
 from pathlib import Path
-
-import numpy as np
+import glob
 import tempfile
 
-import glob, os
 import anndata
-from anndata._io.merge import concat_on_disk
-from anndata._core.merge import concat 
+from anndata._core.merge import concat
 import dask.array as da
 import zarr
 
-from anndata.experimental import read_dispatched, read_elem
+from anndata.experimental import read_dispatched, read_elem, concat_on_disk
+
 
 NPS = set(glob.glob(str(Path(__file__).parent) + "/data/*np*"))
 CSRS = set(glob.glob(str(Path(__file__).parent) + "/data/*csr*"))
@@ -39,7 +37,10 @@ class ConcatOnDisk(NoSetup):
         concat_on_disk(self.filepaths, self.writepth, axis=self.axis)
 
     def peakmem_func_full(self, *args, **kwargs):
-        concat_on_disk(self.filepaths, self.writepth, axis=self.axis)
+        import dask.distributed as dd
+
+        with dd.LocalCluster(memory_limit="100MB"):
+            concat_on_disk(self.filepaths, self.writepth, axis=self.axis)
 
 
 class Concat(NoSetup):
