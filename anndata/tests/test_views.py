@@ -130,30 +130,21 @@ def test_modify_view_component(matrix_type, mapping_name):
     assert init_hash == joblib.hash(adata)
 
 
-# TODO: These tests could probably be condensed into a fixture
-#       based test for obsm and varm
-def test_set_obsm_key(adata):
+@pytest.mark.parametrize("attr", ["obsm", "varm"])
+def test_set_obsm_key(adata, attr):
     init_hash = joblib.hash(adata)
 
-    orig_obsm_val = adata.obsm["o"].copy()
-    subset_obsm = adata[:50]
-    assert subset_obsm.is_view
-    subset_obsm.obsm["o"] = np.ones((50, 20))
-    assert not subset_obsm.is_view
-    assert np.all(adata.obsm["o"] == orig_obsm_val)
+    orig_val = getattr(adata, attr)["o"].copy()
+    subset = adata[:50] if attr == "obsm" else adata[:, :50]
 
-    assert init_hash == joblib.hash(adata)
+    assert subset.is_view
 
+    with pytest.warns(ad.ImplicitModificationWarning, match=rf".*\.{attr}\['o'\].*"):
+        getattr(subset, attr)["o"] = new_val = np.ones((50, 20))
 
-def test_set_varm_key(adata):
-    init_hash = joblib.hash(adata)
-
-    orig_varm_val = adata.varm["o"].copy()
-    subset_varm = adata[:, :50]
-    assert subset_varm.is_view
-    subset_varm.varm["o"] = np.ones((50, 20))
-    assert not subset_varm.is_view
-    assert np.all(adata.varm["o"] == orig_varm_val)
+    assert not subset.is_view
+    assert np.all(getattr(adata, attr)["o"] == orig_val)
+    assert np.any(getattr(subset, attr)["o"] == new_val)
 
     assert init_hash == joblib.hash(adata)
 
@@ -413,7 +404,10 @@ def test_view_delitem(attr):
     adata_hash = joblib.hash(adata)
     view_hash = joblib.hash(view)
 
-    getattr(view, attr).__delitem__("to_delete")
+    with pytest.warns(
+        ad.ImplicitModificationWarning, match=rf".*\.{attr}\['to_delete'\].*"
+    ):
+        getattr(view, attr).__delitem__("to_delete")
 
     assert not view.is_view
     assert "to_delete" not in getattr(view, attr)
@@ -569,6 +563,30 @@ def test_negative_scalar_index(adata, index: int, obs: bool):
     np.testing.assert_array_equal(
         adata_pos_subset.var_names, adata_neg_subset.var_names
     )
+
+
+def test_viewness_propagation_nan():
+    """Regression test for https://github.com/scverse/anndata/issues/239"""
+    adata = ad.AnnData(np.random.random((10, 10)))
+    adata = adata[:, [0, 2, 4]]
+    v = adata.X.var(axis=0)
+    assert not isinstance(v, ArrayView), type(v).mro()
+    # this used to break
+    v[np.isnan(v)] = 0
+
+
+def test_viewness_propagation_allclose(adata):
+    """Regression test for https://github.com/scverse/anndata/issues/191"""
+    adata.varm["o"][4:10] = np.tile(np.nan, (10 - 4, adata.varm["o"].shape[1]))
+    a = adata[:50].copy()
+    b = adata[:50]
+
+    # .copy() turns view to ndarray, so this was fine:
+    assert np.allclose(a.varm["o"], b.varm["o"].copy(), equal_nan=True)
+    # Next line triggered the mutation:
+    assert np.allclose(a.varm["o"], b.varm["o"], equal_nan=True)
+    # Showing that the mutation didn’t happen:
+    assert np.allclose(a.varm["o"], b.varm["o"].copy(), equal_nan=True)
 
 
 @pytest.mark.parametrize("spmat", [sparse.csr_matrix, sparse.csc_matrix])

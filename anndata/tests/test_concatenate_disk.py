@@ -5,7 +5,9 @@ import pandas as pd
 import pytest
 from scipy import sparse
 
-from anndata._io.merge import concat_on_disk
+from anndata.experimental.merge import concat_on_disk, as_group
+from anndata.experimental import write_elem, read_elem
+
 from anndata import AnnData, concat
 from anndata.tests.helpers import (
     assert_equal,
@@ -14,9 +16,6 @@ from anndata.tests.helpers import (
 
 
 from anndata.utils import asarray
-
-
-from anndata import read_h5ad, read_zarr
 
 
 GEN_ADATA_OOC_CONCAT_ARGS = dict(
@@ -52,46 +51,45 @@ def file_format(request):
     return request.param
 
 
+# trying with 10 should be slow but will guarantee that the feature is being used
+@pytest.fixture(params=[10, 100_000_000])
+def max_loaded_sparse_elems(request):
+    return request.param
+
+
 def _adatas_to_paths(adatas, tmp_path, file_format):
     """
     Gets list of adatas, writes them and returns their paths as zarr
     """
     paths = None
 
-    def write_func(adata, path):
-        if file_format == "h5ad":
-            adata.write(path)
-        else:
-            adata.write_zarr(path)
-
     if isinstance(adatas, Mapping):
         paths = {}
         for k, v in adatas.items():
             p = tmp_path / (f"{k}." + file_format)
-            write_func(v, p)
+            write_elem(as_group(p, mode="a"), "", v)
             paths[k] = p
     else:
         paths = []
         for i, a in enumerate(adatas):
             p = tmp_path / (f"{i}." + file_format)
-            write_func(a, p)
+            write_elem(as_group(p, mode="a"), "", a)
             paths += [p]
     return paths
 
 
-def assert_eq_concat_on_disk(adatas, tmp_path, file_format, *args, **kwargs):
-    def read_func(path):
-        if file_format == "h5ad":
-            return read_h5ad(path)
-        return read_zarr(path)
-
+def assert_eq_concat_on_disk(
+    adatas, tmp_path, file_format, max_loaded_sparse_elems=None, *args, **kwargs
+):
     # create one from the concat function
     res1 = concat(adatas, *args, **kwargs)
     # create one from the on disk concat function
     paths = _adatas_to_paths(adatas, tmp_path, file_format)
     out_name = tmp_path / ("out." + file_format)
+    if max_loaded_sparse_elems is not None:
+        kwargs["max_loaded_sparse_elems"] = max_loaded_sparse_elems
     concat_on_disk(paths, out_name, *args, **kwargs)
-    res2 = read_func(out_name)
+    res2 = read_elem(as_group(out_name))
     assert_equal(res1, res2, exact=False)
 
 
@@ -106,7 +104,9 @@ def get_array_type(array_type, axis):
         raise NotImplementedError(f"array_type {array_type} not implemented")
 
 
-def test_anndatas_without_reindex(axis, array_type, join_type, tmp_path, file_format):
+def test_anndatas_without_reindex(
+    axis, array_type, join_type, tmp_path, max_loaded_sparse_elems, file_format
+):
     N = 50
     M = 50
     sparse_fmt = "csr"
@@ -126,7 +126,55 @@ def test_anndatas_without_reindex(axis, array_type, join_type, tmp_path, file_fo
         )
         adatas.append(a)
 
-    assert_eq_concat_on_disk(adatas, tmp_path, file_format, axis=axis, join=join_type)
+    assert_eq_concat_on_disk(
+        adatas,
+        tmp_path,
+        file_format,
+        max_loaded_sparse_elems,
+        axis=axis,
+        join=join_type,
+    )
+
+
+def test_anndatas_with_reindex(
+    axis, array_type, join_type, tmp_path, file_format, max_loaded_sparse_elems
+):
+    N = 50
+    M = 50
+    adatas = []
+
+    sparse_fmt = "csc"
+    if axis == 0:
+        sparse_fmt = "csr"
+
+    for _ in range(5):
+        M = np.random.randint(1, 100)
+        N = np.random.randint(1, 100)
+
+        a = gen_adata(
+            (M, N),
+            X_type=get_array_type(array_type, axis),
+            sparse_fmt=sparse_fmt,
+            obsm_types=(
+                get_array_type("sparse", 1 - axis),
+                np.ndarray,
+                pd.DataFrame,
+            ),
+            varm_types=(get_array_type("sparse", axis), np.ndarray, pd.DataFrame),
+            layers_types=(get_array_type("sparse", axis), np.ndarray, pd.DataFrame),
+        )
+        a.layers["sparse"] = get_array_type("sparse", axis)(a.layers["sparse"])
+        a.varm["sparse"] = get_array_type("sparse", 1 - axis)(a.varm["sparse"])
+        adatas.append(a)
+
+    assert_eq_concat_on_disk(
+        adatas,
+        tmp_path,
+        file_format,
+        max_loaded_sparse_elems,
+        axis=axis,
+        join=join_type,
+    )
 
 
 def test_concat_ordered_categoricals_retained(tmp_path, file_format):

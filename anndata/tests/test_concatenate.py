@@ -1086,11 +1086,9 @@ def test_concatenate_uns(unss, merge_strategy, result, value_gen):
     print(merge_strategy, "\n", unss, "\n", result)
     result, *unss = permute_nested_values([result] + unss, value_gen)
     adatas = [uns_ad(uns) for uns in unss]
-    assert_equal(
-        adatas[0].concatenate(adatas[1:], uns_merge=merge_strategy).uns,
-        result,
-        elem_name="uns",
-    )
+    with pytest.warns(FutureWarning, match=r"concatenate method is deprecated"):
+        merged = AnnData.concatenate(*adatas, uns_merge=merge_strategy).uns
+    assert_equal(merged, result, elem_name="uns")
 
 
 def test_transposed_concat(array_type, axis, join_type, merge_strategy, fill_val):
@@ -1218,6 +1216,34 @@ def test_concat_ordered_categoricals_retained():
     assert c.obs["cat_ordered"].cat.ordered
 
 
+def test_bool_promotion():
+    np_bool = AnnData(
+        np.ones((5, 1)),
+        obs=pd.DataFrame({"bool": [True] * 5}, index=[f"cell{i:02}" for i in range(5)]),
+    )
+    missing = AnnData(
+        np.ones((5, 1)),
+        obs=pd.DataFrame(index=[f"cell{i:02}" for i in range(5, 10)]),
+    )
+    result = concat({"np_bool": np_bool, "b": missing}, join="outer", label="batch")
+
+    assert pd.api.types.is_bool_dtype(result.obs["bool"])
+    assert pd.isnull(result.obs.loc[result.obs["batch"] == "missing", "bool"]).all()
+
+    # Check that promotion doesn't occur if it doesn't need to:
+    np_bool_2 = AnnData(
+        np.ones((5, 1)),
+        obs=pd.DataFrame(
+            {"bool": [True] * 5}, index=[f"cell{i:02}" for i in range(5, 10)]
+        ),
+    )
+    result = concat(
+        {"np_bool": np_bool, "np_bool_2": np_bool_2}, join="outer", label="batch"
+    )
+
+    assert result.obs["bool"].dtype == np.dtype(bool)
+
+
 def test_concat_names(axis):
     def get_annot(adata):
         return getattr(adata, ("obs", "var")[axis])
@@ -1257,23 +1283,6 @@ def test_concat_size_0_dim(axis, join_type, merge_strategy, shape):
     b = gen_adata(shape)
     alt_axis = 1 - axis
     dim = ("obs", "var")[axis]
-
-    # TODO: Remove, see: https://github.com/scverse/anndata/issues/905
-    import awkward as ak
-
-    if (
-        (join_type == "inner")
-        and (merge_strategy in ("same", "unique"))
-        and ((axis, shape.index(0)) in [(0, 1), (1, 0)])
-        and ak.__version__ == "2.0.7"  # indicates if a release has happened
-    ):
-        aligned_mapping = (b.obsm, b.varm)[1 - axis]
-        to_remove = []
-        for k, v in aligned_mapping.items():
-            if isinstance(v, ak.Array):
-                to_remove.append(k)
-        for k in to_remove:
-            aligned_mapping.pop(k)
 
     expected_size = expected_shape(a, b, axis=axis, join=join_type)
     result = concat(
@@ -1424,3 +1433,20 @@ def test_outer_concat_outputs_nullable_bool_writable(tmp_path):
 
     adatas = concat({"a": a, "b": b}, join="outer", label="group")
     adatas.write(tmp_path / "test.h5ad")
+
+
+def test_concat_duplicated_columns(join_type):
+    # https://github.com/scverse/anndata/issues/483
+    a = AnnData(
+        obs=pd.DataFrame(
+            np.ones((5, 2)), columns=["a", "a"], index=[str(x) for x in range(5)]
+        )
+    )
+    b = AnnData(
+        obs=pd.DataFrame(
+            np.ones((5, 1)), columns=["a"], index=[str(x) for x in range(5, 10)]
+        )
+    )
+
+    with pytest.raises(pd.errors.InvalidIndexError, match=r"'a'"):
+        concat([a, b], join=join_type)
