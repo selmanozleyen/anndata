@@ -170,29 +170,36 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         return CompressedVectors.from_buffers(new_data, new_indices, new_indptr)
 
     def get_compressed_vectors(self, row_idxs: Iterable[int]) -> CompressedVectors:
-        indptr_slices = [slice(*(self.indptr[i : i + 2])) for i in row_idxs]
+        xp = self.np_module
+        rows = xp.asarray(row_idxs)
+        # Each row is one contiguous run of `data`/`indices`, so the selection is
+        # fully described by the run starts and lengths. Deriving them with array
+        # ops rather than a per-row Python loop keeps this O(1) in interpreter
+        # overhead, which dominates the CPU side of a large batched read.
+        starts = self.indptr[rows]
+        lengths = self.indptr[rows + 1] - starts
+        indptr = xp.concatenate([xp.zeros(1, dtype=lengths.dtype), xp.cumsum(lengths)])
         # HDF5 cannot handle out-of-order integer indexing
         if isinstance(self.data, zarr.Array):
-            as_np_indptr = self.np_module.concatenate([
-                self.np_module.arange(s.start, s.stop) for s in indptr_slices
-            ])
+            # Expand the runs into coordinates without materialising one array
+            # per row: a flat ramp, rebased per run, offset to each run's start.
+            coords = xp.arange(int(indptr[-1]))
+            coords -= xp.repeat(indptr[:-1], lengths)
+            coords += xp.repeat(starts, lengths)
             data: DenseType
             indices: DenseType
             if supports_async_coordinate_selection:
-                data, indices = _read_concurrently(
-                    self.data, self.indices, as_np_indptr
-                )
+                data, indices = _read_concurrently(self.data, self.indices, coords)
             else:
-                data = self.data[as_np_indptr]
-                indices = self.indices[as_np_indptr]
+                data = self.data[coords]
+                indices = self.indices[coords]
         else:
-            data: np.ndarray = np.concatenate([self.data[s] for s in indptr_slices])
-            indices: np.ndarray = np.concatenate([
-                self.indices[s] for s in indptr_slices
-            ])
-        indptr = self.np_module.array(
-            list(accumulate(chain((0,), (s.stop - s.start for s in indptr_slices))))
-        )
+            slices = [
+                slice(int(s), int(s) + int(n))
+                for s, n in zip(starts, lengths, strict=True)
+            ]
+            data: np.ndarray = np.concatenate([self.data[s] for s in slices])
+            indices: np.ndarray = np.concatenate([self.indices[s] for s in slices])
         return CompressedVectors.from_buffers(data, indices, indptr)
 
     def get_compressed_vectors_for_slices(
