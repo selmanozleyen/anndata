@@ -140,6 +140,19 @@ def test_backed_indexing(
     assert_equal(csr_mem[:, var_idx].X, dense_disk[:, var_idx].X)
 
 
+def test_overlapping_sparse_reads(
+    ondisk_equivalent_adata: tuple[AnnData, AnnData, AnnData, AnnData],
+):
+    """The overlapped `data`/`indices` read must match the in-memory reference."""
+    csr_mem, csr_disk, csc_disk, _ = ondisk_equivalent_adata
+    # Scattered, unsorted and duplicated, so the selection is not one run.
+    obs_idx = np.array([7, 0, 31, 7, 18])
+
+    assert_equal(csr_mem.X[obs_idx], csr_disk.X[obs_idx])
+    assert_equal(csr_mem[obs_idx].X, csr_disk[obs_idx].X)
+    assert_equal(csr_mem.X[...], csc_disk.X[...])
+
+
 def test_backed_ellipsis_indexing(
     ondisk_equivalent_adata: tuple[AnnData, AnnData, AnnData, AnnData],
     ellipsis_index: tuple[EllipsisType | slice, ...] | EllipsisType,

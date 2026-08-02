@@ -12,10 +12,12 @@ See the copyright and license note in this directory source code.
 # - think about supporting the COO format
 from __future__ import annotations
 
+import asyncio
 from abc import ABC
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import cached_property, singledispatchmethod
+from importlib.metadata import version
 from itertools import accumulate, chain, pairwise
 from math import floor
 from pathlib import Path
@@ -25,6 +27,7 @@ import h5py
 import numpy as np
 import scipy.sparse as ss
 import zarr
+from packaging.version import Version
 
 from testing.anndata._doctest import doctest_filterwarnings
 
@@ -173,8 +176,15 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
             as_np_indptr = self.np_module.concatenate([
                 self.np_module.arange(s.start, s.stop) for s in indptr_slices
             ])
-            data: DenseType = self.data[as_np_indptr]
-            indices: DenseType = self.indices[as_np_indptr]
+            data: DenseType
+            indices: DenseType
+            if supports_async_coordinate_selection:
+                data, indices = _read_concurrently(
+                    self.data, self.indices, as_np_indptr
+                )
+            else:
+                data = self.data[as_np_indptr]
+                indices = self.indices[as_np_indptr]
         else:
             data: np.ndarray = np.concatenate([self.data[s] for s in indptr_slices])
             indices: np.ndarray = np.concatenate([
@@ -323,6 +333,36 @@ def is_sparse_indexing_overridden(
         isinstance(major_indexer, int | np.integer | slice)
         or (isinstance(major_indexer, np.ndarray) and major_indexer.ndim == 1)
     )
+
+
+# `AsyncArray.get_coordinate_selection` was added in zarr 3.1.2. Below that the
+# reads stay sequential, matching how `supports_auto_shard_size` gates a newer
+# zarr feature in `_io/specs/methods.py` rather than raising the floor.
+supports_async_coordinate_selection = Version(version("zarr")) >= Version("3.1.2")
+
+
+def _read_concurrently(
+    data: zarr.Array, indices: zarr.Array, coords: np.ndarray
+) -> tuple[DenseType, DenseType]:
+    """Fetch the same selection from the `data` and `indices` arrays concurrently.
+
+    The two are independent reads over identical coordinates, so issuing them
+    back to back costs their sum rather than their max. Each is already
+    internally concurrent; they simply never overlap each other.
+    """
+    from zarr.core.sync import sync
+
+    async def _gather() -> tuple[DenseType, DenseType]:
+        # `get_coordinate_selection` is the async mirror of what
+        # `zarr.Array.__getitem__` dispatches to for an integer-array selection.
+        # `AsyncArray.getitem` is basic indexing only and would reject `coords`.
+        data_out, indices_out = await asyncio.gather(
+            data._async_array.get_coordinate_selection(coords),
+            indices._async_array.get_coordinate_selection(coords),
+        )
+        return data_out, indices_out
+
+    return sync(_gather())
 
 
 class BaseCompressedSparseDataset[GroupT: _GroupStorageType, ArrayT: _ArrayStorageType](
