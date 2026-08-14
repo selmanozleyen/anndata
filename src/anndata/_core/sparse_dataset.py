@@ -16,6 +16,7 @@ from abc import ABC
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import cached_property, singledispatchmethod
+from concurrent.futures import ThreadPoolExecutor
 from itertools import accumulate, chain, pairwise
 from math import floor
 from pathlib import Path
@@ -91,6 +92,37 @@ def _read_dense(
     arr: DenseType | _ArrayStorageType, idx: slice | np.ndarray | EllipsisType
 ) -> DenseType:
     return arr[idx]
+
+
+def _read_data_and_indices(
+    data_arr: DenseType | _ArrayStorageType,
+    indices_arr: DenseType | _ArrayStorageType,
+    idx: slice | np.ndarray | EllipsisType,
+) -> tuple[DenseType, DenseType]:
+    """Read `data` and `indices` for one selection, overlapping the two where safe.
+
+    They are independent reads of equal size into different arrays, so issuing them
+    one after the other leaves the second one's IO entirely unoverlapped. For a
+    backed CSR read that is half the wall clock: `indices` is not smaller than
+    `data` -- stored as uint16 it compresses only ~1.5x against float32's ~4x, so
+    on disk it is often the larger of the two.
+
+    Measured on GPFS (LRZ AI, 14 concatenated CSR datasets, 9192-row batches):
+    issuing per-array reads concurrently was worth 1.4x on cold reads and 3.5x
+    once the bytes were cache-warm, where the sequential form plateaued at ~4 of
+    16 cores because nothing overlapped.
+
+    Only for zarr. The zarrs pipeline releases the GIL, so the two reads genuinely
+    run at once; h5py holds a lock and is not thread-safe, so there the sequential
+    path is both the correct one and no slower. One worker rather than two: the
+    caller's own thread reads `data` while the pool reads `indices`.
+    """
+    if not isinstance(data_arr, zarr.Array):
+        return _read_dense(data_arr, idx), _read_dense(indices_arr, idx)
+    with ThreadPoolExecutor(1) as pool:
+        pending_indices = pool.submit(_read_dense, indices_arr, idx)
+        data = _read_dense(data_arr, idx)
+        return data, pending_indices.result()
 
 
 def _index_in_memory(
@@ -193,8 +225,9 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
 
         new_indptr -= start
 
-        new_data = _read_dense(self.data, slice(start, stop))
-        new_indices = _read_dense(self.indices, slice(start, stop))
+        new_data, new_indices = _read_data_and_indices(
+            self.data, self.indices, slice(start, stop)
+        )
 
         return CompressedVectors.from_buffers(new_data, new_indices, new_indptr)
 
@@ -209,8 +242,9 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
             as_np_indptr = self.np_module.concatenate([
                 self.np_module.arange(s.start, s.stop) for s in indptr_slices
             ])
-            data = _read_dense(self.data, as_np_indptr)
-            indices = _read_dense(self.indices, as_np_indptr)
+            data, indices = _read_data_and_indices(
+                self.data, self.indices, as_np_indptr
+            )
         else:
             data = np.concatenate([_read_dense(self.data, s) for s in indptr_slices])
             indices = np.concatenate([
@@ -235,8 +269,9 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
             indptr_int = self.np_module.concatenate([
                 self.np_module.arange(s.start, s.stop) for s in indptr_limits
             ])
-            data = _read_dense(self.data, indptr_int)
-            indices = _read_dense(self.indices, indptr_int)
+            data, indices = _read_data_and_indices(
+                self.data, self.indices, indptr_int
+            )
         else:
             data = np.concatenate([_read_dense(self.data, s) for s in indptr_limits])
             indices = np.concatenate([

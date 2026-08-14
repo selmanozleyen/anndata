@@ -739,3 +739,35 @@ def test_append_overflow_check(group_fn, sparse_class, tmp_path):
 
     # Check for any modification
     assert_equal(backed, orig_mtx)
+
+
+def test_read_data_and_indices_agrees_with_sequential(
+    tmp_path: Path, diskfmt: Literal["h5ad", "zarr"]
+):
+    """Overlapping the data/indices reads must not change what comes back.
+
+    They are independent reads, so for zarr they are issued at once -- the zarrs
+    pipeline releases the GIL, so they genuinely overlap -- while h5py takes the
+    sequential path because it is not thread-safe. Both have to return exactly
+    what reading them one after the other returns, for a slice and for the
+    out-of-order integer array that a row batch turns into.
+    """
+    from anndata._core.sparse_dataset import _read_data_and_indices, _read_dense
+
+    matrix = sparse.random(120, 40, density=0.2, format="csr", random_state=0)
+    path = tmp_path / f"m.{diskfmt}"
+    if diskfmt == "zarr":
+        group = open_write_group(path)
+    else:
+        group = h5py.File(path, "w")
+    ad.io.write_elem(group, "X", matrix)
+    stored_data = group["X"]["data"]
+    stored_indices = group["X"]["indices"]
+
+    for idx in (slice(3, 57), np.arange(5, 90, 3)):
+        data, indices = _read_data_and_indices(stored_data, stored_indices, idx)
+        np.testing.assert_array_equal(data, _read_dense(stored_data, idx))
+        np.testing.assert_array_equal(indices, _read_dense(stored_indices, idx))
+
+    if diskfmt == "h5ad":
+        group.close()
