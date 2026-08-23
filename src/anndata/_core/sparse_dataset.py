@@ -12,6 +12,7 @@ See the copyright and license note in this directory source code.
 # - think about supporting the COO format
 from __future__ import annotations
 
+import asyncio
 from abc import ABC
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -91,6 +92,67 @@ def _read_dense(
     arr: DenseType | _ArrayStorageType, idx: slice | np.ndarray | EllipsisType
 ) -> DenseType:
     return arr[idx]
+
+
+class _RowSelection(NamedTuple):
+    """Which coordinates a set of whole rows selects, and where each one lands.
+
+    `coords` is strictly increasing, which is the only form a backed read is described
+    efficiently in: contiguous ascending ranges rather than scattered points. Getting
+    there costs a sort of the ROWS -- thousands -- rather than of their coordinates, of
+    which there are millions.
+
+    Deduplicating is not an optimisation, it is required. A row asked for twice replays
+    its coordinate run from the start, so `[3, 3, 10]` yields `50 51 52 50 51 52 90 91`
+    -- decreasing at the seam even though the rows ascend -- and a store that only
+    accepts ordered ranges refuses it.
+    """
+
+    coords: np.ndarray
+    """Ascending, distinct coordinates into `data`/`indices`. The read."""
+    indptr: np.ndarray
+    """Row boundaries of the RESULT, in the caller's order, repeats included."""
+    take: np.ndarray | None
+    """Gather placing the read into the caller's order, or None if it is already there."""
+
+
+def _select_rows(
+    rows: np.ndarray, indptr: DenseType | _ArrayStorageType, xp: ModuleType = np
+) -> _RowSelection:
+    """Derive the read for whole `rows`, in any order, repeats allowed."""
+    # Distinct rows ascending, plus the map from each requested position to one of them.
+    order = xp.argsort(rows, kind="stable")
+    ordered = rows[order]
+    first = xp.empty(ordered.size, dtype=bool)
+    first[0] = True
+    xp.not_equal(ordered[1:], ordered[:-1], out=first[1:])
+    uniq = ordered[first]
+    which = xp.empty(rows.size, dtype=xp.int64)
+    which[order] = xp.cumsum(first) - 1
+
+    # Each row is one contiguous run, so starts and lengths describe the whole read.
+    # Two reads of `indptr` rather than one per row: interpreter overhead dominates the
+    # CPU side of a large batch.
+    starts = _read_dense(indptr, uniq)
+    lengths = _read_dense(indptr, uniq + 1) - starts
+    read_offsets = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(lengths)])
+    out_lengths = lengths[which]
+    out_indptr = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(out_lengths)])
+
+    # A flat ramp, rebased per run and offset to that run's start, rather than one array
+    # per row. Strictly increasing, since `uniq` ascends and `indptr` never decreases.
+    coords = xp.arange(int(read_offsets[-1]), dtype=xp.int64)
+    coords -= xp.repeat(read_offsets[:-1], lengths)
+    coords += xp.repeat(starts, lengths)
+
+    if uniq.size == rows.size and bool((which == xp.arange(rows.size)).all()):
+        # Already ascending and distinct: the read is the answer, so do not pay a full
+        # copy to reorder nothing.
+        return _RowSelection(coords, out_indptr, None)
+    take = xp.arange(int(out_indptr[-1]), dtype=xp.int64)
+    take -= xp.repeat(out_indptr[:-1], out_lengths)
+    take += xp.repeat(read_offsets[which], out_lengths)
+    return _RowSelection(coords, out_indptr, take)
 
 
 def _index_in_memory(
@@ -199,23 +261,23 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         return CompressedVectors.from_buffers(new_data, new_indices, new_indptr)
 
     def get_compressed_vectors(self, row_idxs: Iterable[int]) -> CompressedVectors:
+        data: DenseType
+        indices: DenseType
+        # HDF5 cannot handle out-of-order integer indexing, so it reads a slice per row
+        # instead; zarr takes the whole selection at once, as ordered coordinates.
+        if isinstance(self.data, zarr.Array):
+            xp = self.np_module
+            selection = _select_rows(xp.asarray(row_idxs), self.indptr, xp)
+            data = _read_dense(self.data, selection.coords)
+            indices = _read_dense(self.indices, selection.coords)
+            if selection.take is not None:
+                data, indices = data[selection.take], indices[selection.take]
+            return CompressedVectors.from_buffers(data, indices, selection.indptr)
         indptr_slices = [
             slice(*_read_dense(self.indptr, slice(i, i + 2))) for i in row_idxs
         ]
-        data: DenseType
-        indices: DenseType
-        # HDF5 cannot handle out-of-order integer indexing
-        if isinstance(self.data, zarr.Array):
-            as_np_indptr = self.np_module.concatenate([
-                self.np_module.arange(s.start, s.stop) for s in indptr_slices
-            ])
-            data = _read_dense(self.data, as_np_indptr)
-            indices = _read_dense(self.indices, as_np_indptr)
-        else:
-            data = np.concatenate([_read_dense(self.data, s) for s in indptr_slices])
-            indices = np.concatenate([
-                _read_dense(self.indices, s) for s in indptr_slices
-            ])
+        data = np.concatenate([_read_dense(self.data, s) for s in indptr_slices])
+        indices = np.concatenate([_read_dense(self.indices, s) for s in indptr_slices])
         indptr = self.np_module.array(
             list(accumulate(chain((0,), (s.stop - s.start for s in indptr_slices))))
         )
@@ -417,6 +479,16 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         """The :class:`numpy.dtype` of the `data` attribute of the sparse matrix."""
         return self._data.dtype
 
+    @property
+    def indices_dtype(self) -> np.dtype:
+        """The :class:`numpy.dtype` of the `indices` attribute of the sparse matrix.
+
+        With :attr:`dtype` and :attr:`indptr`, this is everything needed to size a read
+        before making it, which is what a caller allocating one buffer across several
+        datasets has to do.
+        """
+        return self._indices.dtype
+
     @classmethod
     def _check_group_format(cls, group: GroupT) -> None:
         group_format = _get_group_format(group)
@@ -595,6 +667,133 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         Cache access to the data to prevent unnecessary reads of the zarray
         """
         return _group_array(self.group, "data")
+
+    @property
+    def indptr(self) -> np.ndarray:
+        """The row boundaries of the backed matrix, in memory.
+
+        Public because sizing a read needs it before the read happens: a caller
+        preallocating one buffer across several datasets has to know each one's nnz up
+        front, and this is what answers that.
+
+        Normally free -- only as long as the major axis, so it is cached on first
+        access. Under ``should_cache_indptr=False`` it is not, and this reads the whole
+        array each time rather than returning something that reads on every element
+        access.
+        """
+        if self._should_cache_indptr:
+            return self._indptr
+        return _read_dense(self._indptr, ...)
+
+    async def _aresolve(self) -> None:
+        """Resolve the backing arrays without a synchronous store call.
+
+        ``group[key]`` is synchronous, and zarr refuses that from inside a running event
+        loop, so the lazy resolution behind `_data`/`_indices`/`_indptr` cannot happen
+        there. :meth:`aread_rows` does it here instead, which is why it asks nothing of
+        the caller. Idempotent, and a no-op once anything has touched them, including an
+        earlier synchronous access.
+        """
+        if not isinstance(self.group, zarr.Group):
+            return  # hdf5 is synchronous throughout; there is nothing to resolve early
+        missing = [
+            name for name in ("_data", "_indices", "_indptr") if name not in self.__dict__
+        ]
+        if not missing:
+            return
+        async_group = self.group._async_group
+        resolved = await asyncio.gather(
+            *(async_group.getitem(name.removeprefix("_")) for name in missing)
+        )
+        for name, async_array in zip(missing, resolved, strict=True):
+            if name == "_indptr" and self._should_cache_indptr:
+                self.__dict__[name] = await async_array.getitem(Ellipsis)
+            else:
+                self.__dict__[name] = zarr.Array(async_array)
+
+    async def aread_rows(
+        self,
+        rows: np.ndarray,
+        *,
+        out: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read whole rows, concurrently, optionally into buffers the caller owns.
+
+        Same read as ``self[rows]`` -- one :func:`_select_rows` behind both -- but
+        awaitable, which is the point. zarr runs a single shared event loop, so the
+        synchronous form deadlocks if called from inside a coroutine already running on
+        it; a caller gathering reads across several datasets cannot use `__getitem__` at
+        all, and can await this one alongside the rest of its work.
+
+        Parameters
+        ----------
+        rows
+            Row indices, in any order, repeats allowed.
+        out
+            ``(data, indices)`` buffers to read into, each as long as the total nnz of
+            `rows` -- sized by the caller from :attr:`indptr`. The read lands in them
+            directly when `rows` is already ascending and distinct, and is placed into
+            them otherwise.
+
+        Returns
+        -------
+        The `data`, `indices` and `indptr` of the selected rows, in the caller's order.
+        """
+        if self.format != "csr":
+            msg = f"aread_rows reads whole rows, so it is csr-only, not {self.format}"
+            raise NotImplementedError(msg)
+        await self._aresolve()
+        data_arr, indices_arr = self._data, self._indices
+        if not isinstance(data_arr, zarr.Array):
+            msg = (
+                "aread_rows needs an async store; "
+                f"{type(data_arr).__name__} has none. Use __getitem__."
+            )
+            raise TypeError(msg)
+
+        rows = np.asarray(rows)
+        if rows.size == 0:
+            empty = out or (
+                np.empty(0, dtype=data_arr.dtype),
+                np.empty(0, dtype=indices_arr.dtype),
+            )
+            return (*empty, np.zeros(1, dtype=np.int64))
+        # Not `self.indptr`: under `should_cache_indptr=False` that reads the array
+        # synchronously, which is the one thing that cannot happen here. Read it through
+        # the async form instead, and do not cache it -- the flag asked for that.
+        indptr = self._indptr
+        if isinstance(indptr, zarr.Array):
+            indptr = await indptr._async_array.getitem(Ellipsis)
+        selection = _select_rows(rows, indptr)
+
+        prototype = zarr.core.buffer.default_buffer_prototype()
+        direct = out is not None and selection.take is None
+        targets = (
+            (prototype.nd_buffer(out[0]), prototype.nd_buffer(out[1]))
+            if direct
+            else (None, None)
+        )
+        # `data` and `indices` are equally long reads of different arrays, so issuing
+        # them one after the other costs their sum where it could cost their max.
+        # `indices` is not the small half: as uint16 it compresses far less than float32
+        # `data`, so on disk it is frequently the larger of the two.
+        data, indices = await asyncio.gather(
+            data_arr._async_array.get_coordinate_selection(
+                selection.coords, out=targets[0], prototype=prototype
+            ),
+            indices_arr._async_array.get_coordinate_selection(
+                selection.coords, out=targets[1], prototype=prototype
+            ),
+        )
+        if selection.take is None:
+            if out is not None:
+                data, indices = out
+            return data, indices, selection.indptr
+        if out is None:
+            return data[selection.take], indices[selection.take], selection.indptr
+        np.take(data, selection.take, out=out[0])
+        np.take(indices, selection.take, out=out[1])
+        return out[0], out[1], selection.indptr
 
     def _to_backed(self) -> BackedSparseMatrix:
         mtx = BackedSparseMatrix(

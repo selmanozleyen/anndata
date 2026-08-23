@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import zarr
 from scipy import sparse
+from zarr.core.sync import sync as run_on_zarr_loop
 
 import anndata as ad
 from anndata._core.anndata import AnnData
@@ -739,3 +740,112 @@ def test_append_overflow_check(group_fn, sparse_class, tmp_path):
 
     # Check for any modification
     assert_equal(backed, orig_mtx)
+
+
+@pytest.mark.zarr_io
+@pytest.mark.parametrize(
+    ("name", "rows"),
+    [
+        ("sorted_distinct", np.array([0, 5, 6, 7, 30, 49])),
+        ("unsorted", np.array([49, 3, 30, 7, 6, 5])),
+        ("duplicates", np.array([5, 5, 30, 3, 3, 3])),
+        ("descending", np.arange(20)[::-1]),
+        ("single", np.array([42])),
+        ("empty", np.array([], dtype=np.int64)),
+    ],
+)
+@pytest.mark.parametrize("use_out", [True, False], ids=["out", "no_out"])
+def test_aread_rows(
+    tmp_path: Path, name: str, rows: NDArray[np.integer], *, use_out: bool
+) -> None:
+    """`aread_rows` must agree with `__getitem__` for any row order, repeats included.
+
+    The sort-and-restore inside it is the whole point -- rows are read once each,
+    ascending, and placed back where the caller asked for them -- so the cases that
+    matter are the ones where the requested order is not the read order.
+    """
+
+    mtx = sparse.random(50, 20, density=0.3, format="csr", random_state=0)
+    group = open_write_group(tmp_path / "test.zarr")
+    ad.io.write_elem(group, "X", mtx)
+    dataset = sparse_dataset(zarr.open_group(tmp_path / "test.zarr", mode="r")["X"])
+
+    out = None
+    if use_out:
+        if rows.size == 0:
+            pytest.skip("no buffers to size for an empty selection")
+        indptr = dataset.indptr
+        nnz = int((indptr[rows + 1] - indptr[rows]).sum())
+        out = (
+            np.empty(nnz, dtype=dataset._data.dtype),
+            np.empty(nnz, dtype=dataset._indices.dtype),
+        )
+
+    data, indices, indptr = run_on_zarr_loop(dataset.aread_rows(rows, out=out))
+    got = sparse.csr_matrix((data, indices, indptr), shape=(rows.size, mtx.shape[1]))
+    assert_equal(got.toarray(), mtx[rows].toarray())
+    if use_out:
+        # The caller's buffers are the result, not a source that was copied from.
+        assert data is out[0]
+        assert indices is out[1]
+
+
+@pytest.mark.zarr_io
+def test_aread_rows_rejects_h5(tmp_path: Path) -> None:
+    """h5py has no async store, so the sync path is the only correct one there."""
+    mtx = sparse.random(20, 10, density=0.3, format="csr", random_state=0)
+    with h5py.File(tmp_path / "test.h5ad", "w") as f:
+        ad.io.write_elem(f, "X", mtx)
+    with h5py.File(tmp_path / "test.h5ad", "r") as f:
+        dataset = sparse_dataset(f["X"])
+        with pytest.raises(TypeError, match="needs an async store"):
+            run_on_zarr_loop(dataset.aread_rows(np.array([1, 2])))
+
+
+@pytest.mark.zarr_io
+@pytest.mark.parametrize(
+    ("name", "rows"),
+    [
+        ("sorted_distinct", np.array([0, 5, 6, 7, 30, 49])),
+        ("unsorted", np.array([49, 3, 30, 7, 6, 5])),
+        ("duplicates", np.array([5, 5, 30, 3, 3, 3])),
+        ("descending", np.arange(20)[::-1]),
+    ],
+)
+def test_getitem_preserves_order_and_repeats(
+    tmp_path: Path, name: str, rows: NDArray[np.integer]
+) -> None:
+    """Reading rows once, ascending, must not change what the caller gets back.
+
+    `get_compressed_vectors` sorts and deduplicates before reading, because a store that
+    only accepts ordered ranges cannot serve a scattered or repeated selection -- a row
+    asked for twice replays its run and the coordinates decrease at the seam. The result
+    still has to be the caller's rows, in the caller's order, repeats included.
+    """
+    mtx = sparse.random(50, 20, density=0.3, format="csr", random_state=0)
+    group = open_write_group(tmp_path / "test.zarr")
+    ad.io.write_elem(group, "X", mtx)
+    dataset = sparse_dataset(zarr.open_group(tmp_path / "test.zarr", mode="r")["X"])
+
+    assert_equal(dataset[rows].toarray(), mtx[rows].toarray())
+
+
+@pytest.mark.zarr_io
+def test_aread_rows_without_cached_indptr(tmp_path: Path) -> None:
+    """`should_cache_indptr=False` must not turn the async read into a sync one.
+
+    Without the cache `_indptr` stays a backed array, and reading it goes through zarr's
+    synchronous bridge -- which raises from inside a running loop. The async path has to
+    fetch it the async way instead.
+    """
+    mtx = sparse.random(50, 20, density=0.3, format="csr", random_state=0)
+    group = open_write_group(tmp_path / "test.zarr")
+    ad.io.write_elem(group, "X", mtx)
+    dataset = sparse_dataset(
+        zarr.open_group(tmp_path / "test.zarr", mode="r")["X"], should_cache_indptr=False
+    )
+
+    rows = np.array([30, 3, 3, 7])
+    data, indices, indptr = run_on_zarr_loop(dataset.aread_rows(rows))
+    got = sparse.csr_matrix((data, indices, indptr), shape=(rows.size, mtx.shape[1]))
+    assert_equal(got.toarray(), mtx[rows].toarray())
