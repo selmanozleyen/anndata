@@ -47,7 +47,7 @@ from .index import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
     from types import EllipsisType, ModuleType
     from typing import Any, Literal
 
@@ -94,13 +94,79 @@ def _read_dense(
     return arr[idx]
 
 
-class _RowSelection(NamedTuple):
-    """Which coordinates a set of whole rows selects, and where each one lands.
+_MIN_MEAN_RUN_ROWS = 7
+"""Rows per contiguous range below which describing a read by element beats describing
+it by range. Shared with :meth:`BackedSparseMatrix.subset_by_major_axis_mask`, which has
+always drawn the line in the same place."""
 
-    `coords` is strictly increasing, which is the only form a backed read is described
-    efficiently in: contiguous ascending ranges rather than scattered points. Getting
-    there costs a sort of the ROWS -- thousands -- rather than of their coordinates, of
-    which there are millions.
+
+class _MultiRangeIndexer(zarr.core.indexing.Indexer):
+    """Several contiguous ranges of a 1-D array, read as ONE selection.
+
+    zarr describes a read as a single selection, so several ranges would otherwise mean
+    several calls, and that per-call overhead grows with the range count -- which is the
+    regime this exists to serve. Chunk projections are re-based onto one output buffer so
+    the ranges land in it back to back, in the order given.
+    """
+
+    def __init__(self, arr: zarr.Array, runs: Sequence[slice]) -> None:
+        # `Array._chunk_grid` since zarr 3.1.7; on the metadata before that.
+        chunk_grid = getattr(arr, "_chunk_grid", None) or arr.metadata.chunk_grid
+        self.indexers = [
+            zarr.core.indexing.BasicIndexer(
+                (run,), shape=arr.metadata.shape, chunk_grid=chunk_grid
+            )
+            for run in runs
+        ]
+        self.shape = (sum(i.shape[0] for i in self.indexers),)
+        self.drop_axes = self.indexers[0].drop_axes
+
+    def __iter__(self) -> Iterator[zarr.core.indexing.ChunkProjection]:
+        at = 0
+        for indexer in self.indexers:
+            for proj in indexer:
+                width = proj.out_selection[0].stop - proj.out_selection[0].start
+                yield type(proj)(
+                    proj.chunk_coords,
+                    proj.chunk_selection,
+                    (slice(at, at + width),),
+                    proj.is_complete_chunk,
+                )
+                at += width
+
+
+def _coordinate_runs(
+    starts: DenseType, lengths: DenseType, xp: ModuleType
+) -> list[slice] | None:
+    """The read as contiguous ranges, or None when it is too fragmented to pay for.
+
+    Rows that are neighbours on disk share a boundary, so a batch of them collapses to a
+    handful of ranges. A range is the form a store reads fastest: `zarrs` takes its Rust
+    path only for one, and even zarr-python spends O(1) describing a range where it
+    spends O(nnz) describing the same span point by point.
+
+    Scattered rows are the opposite -- the ranges come to outnumber what they hold, and
+    describing the read by element wins instead.
+    """
+    stops = starts + lengths
+    breaks = xp.flatnonzero(starts[1:] != stops[:-1])
+    if starts.size <= (breaks.size + 1) * _MIN_MEAN_RUN_ROWS:
+        return None
+    firsts = xp.concatenate([xp.zeros(1, dtype=breaks.dtype), breaks + 1])
+    lasts = xp.concatenate([breaks, xp.full(1, starts.size - 1, dtype=breaks.dtype)])
+    return [
+        slice(int(a), int(b)) for a, b in zip(starts[firsts], stops[lasts], strict=True)
+    ]
+
+
+class _RowSelection(NamedTuple):
+    """Which part of `data`/`indices` a set of whole rows selects, and where it lands.
+
+    The read is described either as `runs` -- contiguous ranges -- or as `coords`, never
+    both; :func:`_coordinate_runs` picks, and the unused one is not built. Both forms are
+    strictly increasing, which is the only shape a backed read is described efficiently
+    in. Getting there costs a sort of the ROWS -- thousands -- rather than of their
+    coordinates, of which there are millions.
 
     Deduplicating is not an optimisation, it is required. A row asked for twice replays
     its coordinate run from the start, so `[3, 3, 10]` yields `50 51 52 50 51 52 90 91`
@@ -108,12 +174,14 @@ class _RowSelection(NamedTuple):
     accepts ordered ranges refuses it.
     """
 
-    coords: np.ndarray
-    """Ascending, distinct coordinates into `data`/`indices`. The read."""
+    coords: np.ndarray | None
+    """Ascending, distinct coordinates into `data`/`indices`, or None if `runs` is set."""
     indptr: np.ndarray
     """Row boundaries of the RESULT, in the caller's order, repeats included."""
     take: np.ndarray | None
     """Gather placing the read into the caller's order, or None if it is already there."""
+    runs: list[slice] | None
+    """Ascending, disjoint ranges of `data`/`indices`, or None if `coords` is set."""
 
 
 def _select_rows(
@@ -139,20 +207,25 @@ def _select_rows(
     out_lengths = lengths[which]
     out_indptr = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(out_lengths)])
 
+    take = None
+    if uniq.size != rows.size or not bool((which == xp.arange(rows.size)).all()):
+        # Not already ascending and distinct, so the read has to be put back in order.
+        # When it is, the read IS the answer and no copy is paid to reorder nothing.
+        take = xp.arange(int(out_indptr[-1]), dtype=xp.int64)
+        take -= xp.repeat(out_indptr[:-1], out_lengths)
+        take += xp.repeat(read_offsets[which], out_lengths)
+
+    # Ranges first: when they win, `coords` is never built, and not building it is most
+    # of the point -- it is the one array here whose size is the nnz of the whole batch.
+    if (runs := _coordinate_runs(starts, lengths, xp)) is not None:
+        return _RowSelection(None, out_indptr, take, runs)
+
     # A flat ramp, rebased per run and offset to that run's start, rather than one array
     # per row. Strictly increasing, since `uniq` ascends and `indptr` never decreases.
     coords = xp.arange(int(read_offsets[-1]), dtype=xp.int64)
     coords -= xp.repeat(read_offsets[:-1], lengths)
     coords += xp.repeat(starts, lengths)
-
-    if uniq.size == rows.size and bool((which == xp.arange(rows.size)).all()):
-        # Already ascending and distinct: the read is the answer, so do not pay a full
-        # copy to reorder nothing.
-        return _RowSelection(coords, out_indptr, None)
-    take = xp.arange(int(out_indptr[-1]), dtype=xp.int64)
-    take -= xp.repeat(out_indptr[:-1], out_lengths)
-    take += xp.repeat(read_offsets[which], out_lengths)
-    return _RowSelection(coords, out_indptr, take)
+    return _RowSelection(coords, out_indptr, take, None)
 
 
 def _index_in_memory(
@@ -268,8 +341,16 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         if isinstance(self.data, zarr.Array):
             xp = self.np_module
             selection = _select_rows(xp.asarray(row_idxs), self.indptr, xp)
-            data = _read_dense(self.data, selection.coords)
-            indices = _read_dense(self.indices, selection.coords)
+            if selection.runs is not None:
+                data = xp.concatenate([
+                    _read_dense(self.data, r) for r in selection.runs
+                ])
+                indices = xp.concatenate([
+                    _read_dense(self.indices, r) for r in selection.runs
+                ])
+            else:
+                data = _read_dense(self.data, selection.coords)
+                indices = _read_dense(self.indices, selection.coords)
             if selection.take is not None:
                 data, indices = data[selection.take], indices[selection.take]
             return CompressedVectors.from_buffers(data, indices, selection.indptr)
@@ -406,7 +487,7 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
 
         # heuristic for whether slicing should be optimized
         if len(slices) > 0:
-            if mean_slice_length(slices) <= 7:
+            if mean_slice_length(slices) <= _MIN_MEAN_RUN_ROWS:
                 return self.get_compressed_vectors(np.where(mask)[0])
             else:
                 return self.get_compressed_vectors_for_slices(slices)
@@ -697,7 +778,9 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         if not isinstance(self.group, zarr.Group):
             return  # hdf5 is synchronous throughout; there is nothing to resolve early
         missing = [
-            name for name in ("_data", "_indices", "_indptr") if name not in self.__dict__
+            name
+            for name in ("_data", "_indices", "_indptr")
+            if name not in self.__dict__
         ]
         if not missing:
             return
@@ -773,17 +856,24 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
             if direct
             else (None, None)
         )
+
         # `data` and `indices` are equally long reads of different arrays, so issuing
         # them one after the other costs their sum where it could cost their max.
         # `indices` is not the small half: as uint16 it compresses far less than float32
         # `data`, so on disk it is frequently the larger of the two.
+        def read(arr, target):
+            if selection.runs is not None:
+                return arr._async_array._get_selection(
+                    _MultiRangeIndexer(arr, selection.runs),
+                    prototype=prototype,
+                    out=target,
+                )
+            return arr._async_array.get_coordinate_selection(
+                selection.coords, out=target, prototype=prototype
+            )
+
         data, indices = await asyncio.gather(
-            data_arr._async_array.get_coordinate_selection(
-                selection.coords, out=targets[0], prototype=prototype
-            ),
-            indices_arr._async_array.get_coordinate_selection(
-                selection.coords, out=targets[1], prototype=prototype
-            ),
+            read(data_arr, targets[0]), read(indices_arr, targets[1])
         )
         if selection.take is None:
             if out is not None:
