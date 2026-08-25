@@ -26,6 +26,7 @@ import h5py
 import numpy as np
 import scipy.sparse as ss
 import zarr
+from zarr.core.sync import sync as zarr_sync
 
 from testing.anndata._doctest import doctest_filterwarnings
 
@@ -47,9 +48,12 @@ from .index import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Coroutine, Iterator, Mapping
     from types import EllipsisType, ModuleType
     from typing import Any, Literal
+
+    from zarr.core.buffer import BufferPrototype, NDBuffer
+    from zarr.core.common import NDArrayLikeOrScalar
 
     from .._types import _ArrayStorageType, _GroupStorageType
     from ..typing import Index, Index1D
@@ -133,6 +137,29 @@ class _MultiRangeIndexer(zarr.core.indexing.Indexer):
                     proj.is_complete_chunk,
                 )
                 at += width
+
+
+def _aread_ranges(
+    arr: zarr.Array,
+    runs: Sequence[slice],
+    *,
+    prototype: BufferPrototype,
+    out: NDBuffer | None = None,
+) -> Coroutine[Any, Any, NDArrayLikeOrScalar]:
+    """Read several contiguous ranges of a zarr array as ONE selection.
+
+    A call per range would instead pay a round-trip onto zarr's event loop each time, and
+    ranges are exactly what there are many of here.
+    """
+    return arr._async_array._get_selection(
+        _MultiRangeIndexer(arr, runs), prototype=prototype, out=out
+    )
+
+
+def _read_ranges(arr: zarr.Array, runs: Sequence[slice]) -> DenseType:
+    """:func:`_aread_ranges` for callers that are not themselves on the event loop."""
+    prototype = zarr.core.buffer.default_buffer_prototype()
+    return zarr_sync(_aread_ranges(arr, runs, prototype=prototype))
 
 
 def _coordinate_runs(
@@ -337,17 +364,14 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         data: DenseType
         indices: DenseType
         # HDF5 cannot handle out-of-order integer indexing, so it reads a slice per row
-        # instead; zarr takes the whole selection at once, as ordered coordinates.
+        # instead; zarr takes the whole selection at once, as whichever of ranges or
+        # ordered coordinates `_select_rows` found cheaper.
         if isinstance(self.data, zarr.Array):
             xp = self.np_module
             selection = _select_rows(xp.asarray(row_idxs), self.indptr, xp)
             if selection.runs is not None:
-                data = xp.concatenate([
-                    _read_dense(self.data, r) for r in selection.runs
-                ])
-                indices = xp.concatenate([
-                    _read_dense(self.indices, r) for r in selection.runs
-                ])
+                data = _read_ranges(self.data, selection.runs)
+                indices = _read_ranges(self.indices, selection.runs)
             else:
                 data = _read_dense(self.data, selection.coords)
                 indices = _read_dense(self.indices, selection.coords)
@@ -373,14 +397,14 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
         data: DenseType
         indices: DenseType
-        # HDF5 cannot handle out-of-order integer indexing
+        # `indptr_limits` already ARE the contiguous ranges of the read, so they are read
+        # as ranges. Flattening them into one point-per-element array -- which zarr used
+        # to do here -- describes the same bytes in O(nnz) rather than O(slices), and a
+        # point selection is not a shape the `zarrs` pipeline can take its Rust path for.
         if isinstance(self.data, zarr.Array):
-            indptr_int = self.np_module.concatenate([
-                self.np_module.arange(s.start, s.stop) for s in indptr_limits
-            ])
-            data = _read_dense(self.data, indptr_int)
-            indices = _read_dense(self.indices, indptr_int)
-        else:
+            data = _read_ranges(self.data, indptr_limits)
+            indices = _read_ranges(self.indices, indptr_limits)
+        else:  # hdf5 is synchronous, so a read per range costs no round-trip
             data = np.concatenate([_read_dense(self.data, s) for s in indptr_limits])
             indices = np.concatenate([
                 _read_dense(self.indices, s) for s in indptr_limits
@@ -863,10 +887,8 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         # `data`, so on disk it is frequently the larger of the two.
         def read(arr, target):
             if selection.runs is not None:
-                return arr._async_array._get_selection(
-                    _MultiRangeIndexer(arr, selection.runs),
-                    prototype=prototype,
-                    out=target,
+                return _aread_ranges(
+                    arr, selection.runs, prototype=prototype, out=target
                 )
             return arr._async_array.get_coordinate_selection(
                 selection.coords, out=target, prototype=prototype
