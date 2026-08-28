@@ -13,6 +13,7 @@ See the copyright and license note in this directory source code.
 from __future__ import annotations
 
 import asyncio
+import os
 from abc import ABC
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -98,9 +99,11 @@ def _read_dense(
     return arr[idx]
 
 
-_MIN_MEAN_RUN_ROWS = 7
+_MIN_MEAN_RUN_ROWS = int(os.environ.get("ANNDATA_MIN_MEAN_RUN_ROWS", "7"))
 """Rows per contiguous range below which describing a read by element beats describing
-it by range. Shared with :meth:`BackedSparseMatrix.subset_by_major_axis_mask`, which has
+it by range. Overridable ONLY so a benchmark can move the line without a second build --
+set it very high to force every read down the coordinate path, which is what a store that
+groups coordinates by chunk wants. Shared with :meth:`BackedSparseMatrix.subset_by_major_axis_mask`, which has
 always drawn the line in the same place."""
 
 
