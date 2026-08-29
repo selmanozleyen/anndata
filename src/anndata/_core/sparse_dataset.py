@@ -162,6 +162,71 @@ def _read_ranges(arr: zarr.Array, runs: Sequence[slice]) -> DenseType:
     return zarr_sync(_aread_ranges(arr, runs, prototype=prototype))
 
 
+def _aread_selection(arr: zarr.Array, idx: slice | np.ndarray, *, prototype):
+    """``arr[idx]`` as a coroutine, for a slice or an ASCENDING integer array.
+
+    `zarr.Array.get_orthogonal_selection` is this plus a `sync`, and `AsyncArray.getitem`
+    cannot stand in: it builds a `BasicIndexer`, which does not take an integer array.
+    """
+    chunk_grid = getattr(arr, "_chunk_grid", None) or arr.metadata.chunk_grid
+    indexer = (
+        zarr.core.indexing.BasicIndexer
+        if isinstance(idx, slice)
+        else zarr.core.indexing.OrthogonalIndexer
+    )((idx,), arr.metadata.shape, chunk_grid)
+    return arr._async_array._get_selection(indexer, prototype=prototype)
+
+
+async def _agather_pair(first, second):
+    """`asyncio.gather` INSIDE the loop.
+
+    Calling `gather` outside it binds the `_GatheringFuture` to whatever loop is current
+    at that moment, and `zarr_sync` then submits it to zarr's own loop -- "got Future
+    attached to a different loop". The coroutines themselves are loop-agnostic until
+    awaited; only `gather` is not. `aread_rows` avoids this by already being a coroutine.
+    """
+    return await asyncio.gather(first, second)
+
+
+def _read_both_ranges(
+    first: zarr.Array, second: zarr.Array, runs: Sequence[slice]
+) -> tuple[DenseType, DenseType]:
+    """The same ranges out of two arrays, in ONE trip onto zarr's event loop.
+
+    `data` and `indices` are independent reads of the same rows and were issued back to
+    back: two crossings of the sync bridge, and the second could not start until the
+    first had finished. Gathered, it is one crossing and they overlap.
+
+    Whether the overlap itself wins depends on whether one read already saturates -- the
+    pipeline's own workers are concurrent within a single call -- but the crossing that
+    goes away does not depend on that.
+    """
+    prototype = zarr.core.buffer.default_buffer_prototype()
+    return tuple(
+        zarr_sync(
+            _agather_pair(
+                _aread_ranges(first, runs, prototype=prototype),
+                _aread_ranges(second, runs, prototype=prototype),
+            )
+        )
+    )
+
+
+def _read_both_dense(
+    first: zarr.Array, second: zarr.Array, idx: slice | np.ndarray
+) -> tuple[DenseType, DenseType]:
+    """:func:`_read_both_ranges` for a selection that is not a list of ranges."""
+    prototype = zarr.core.buffer.default_buffer_prototype()
+    return tuple(
+        zarr_sync(
+            _agather_pair(
+                _aread_selection(first, idx, prototype=prototype),
+                _aread_selection(second, idx, prototype=prototype),
+            )
+        )
+    )
+
+
 def _coordinate_runs(
     starts: DenseType, lengths: DenseType, xp: ModuleType
 ) -> list[slice] | None:
@@ -355,8 +420,13 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
 
         new_indptr -= start
 
-        new_data = _read_dense(self.data, slice(start, stop))
-        new_indices = _read_dense(self.indices, slice(start, stop))
+        if isinstance(self.data, zarr.Array):
+            new_data, new_indices = _read_both_dense(
+                self.data, self.indices, slice(start, stop)
+            )
+        else:  # hdf5 is synchronous; there is no event loop to gather onto
+            new_data = _read_dense(self.data, slice(start, stop))
+            new_indices = _read_dense(self.indices, slice(start, stop))
 
         return CompressedVectors.from_buffers(new_data, new_indices, new_indptr)
 
@@ -370,11 +440,13 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
             xp = self.np_module
             selection = _select_rows(xp.asarray(row_idxs), self.indptr, xp)
             if selection.runs is not None:
-                data = _read_ranges(self.data, selection.runs)
-                indices = _read_ranges(self.indices, selection.runs)
+                data, indices = _read_both_ranges(
+                    self.data, self.indices, selection.runs
+                )
             else:
-                data = _read_dense(self.data, selection.coords)
-                indices = _read_dense(self.indices, selection.coords)
+                data, indices = _read_both_dense(
+                    self.data, self.indices, selection.coords
+                )
             if selection.take is not None:
                 data, indices = data[selection.take], indices[selection.take]
             return CompressedVectors.from_buffers(data, indices, selection.indptr)
@@ -402,8 +474,7 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         # to do here -- describes the same bytes in O(nnz) rather than O(slices), and a
         # point selection is not a shape the `zarrs` pipeline can take its Rust path for.
         if isinstance(self.data, zarr.Array):
-            data = _read_ranges(self.data, indptr_limits)
-            indices = _read_ranges(self.indices, indptr_limits)
+            data, indices = _read_both_ranges(self.data, self.indices, indptr_limits)
         else:  # hdf5 is synchronous, so a read per range costs no round-trip
             data = np.concatenate([_read_dense(self.data, s) for s in indptr_limits])
             indices = np.concatenate([
