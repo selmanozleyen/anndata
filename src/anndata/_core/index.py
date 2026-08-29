@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, cast, overload
 import h5py
 import numpy as np
 import pandas as pd
+import zarr
 from numpy.typing import NDArray
 from scipy import sparse
 
@@ -417,9 +418,15 @@ def _subset_dispatch(
         # zarr and cupy arrays are indexed just like numpy ones, but aren’t typed as such
         a = cast("np.ndarray", a)
 
-    numpy_idx = _as_numpy_subset_idx(subset_idx)
+    return _subset_numpy_like(a, _as_numpy_subset_idx(subset_idx))
 
-    # Select as combination of indexes, not coordinates
+
+def _subset_numpy_like(a: AlignedArray, numpy_idx: NumpySubsetIdx) -> np.ndarray:
+    """Index a numpy, zarr or cupy array by combination of indexes, not coordinates.
+
+    Named so the zarr path below can reach it: that path only reorders the selection and
+    still has to do the indexing itself, and calling the dispatch base would recurse.
+    """
     # Correcting for indexing behaviour of np.ndarray
     if all(isinstance(x, Iterable) for x in numpy_idx):
         return a[np.ix_(*numpy_idx)]
@@ -506,6 +513,42 @@ def _subset_awkarray(a: AwkArray, subset_idx: NumpySubsetIdx) -> AwkArray:
     if all(isinstance(x, Iterable) for x in subset_idx):
         return a[np.ix_(*subset_idx)]
     return a[subset_idx]
+
+
+@_subset_dispatch.register(zarr.Array)
+@_ensure_numpy_idx
+def _subset_zarr(a: zarr.Array, subset_idx: NumpySubsetIdx) -> np.ndarray:
+    """Read a zarr array with its one integer axis SORTED, then restore the caller's order.
+
+    The h5py path above sorts because HDF5 refuses an unsorted selection. zarr accepts one,
+    so this path used to hand the store whatever order the caller had -- and that is not
+    free. A codec pipeline can only describe a NON-DECREASING integer axis: zarrs declines
+    an unsorted one with `DiscontiguousArrayError` out of `make_slice_selection`, and
+    zarr-python then serves it quietly, at zarr-python's speed, under zarrs' name. Nothing
+    fails; the read is just no longer the read that was asked for.
+
+    Sorting is transparent -- read in store order, invert the permutation on the way out --
+    so callers see exactly the rows they asked for, in the order they asked for them.
+
+    Only the single-array-axis case is reordered. Two array axes index coordinate-wise
+    through `np.ix_`, where a per-axis permutation is not a permutation of the result, and
+    a boolean mask is increasing already.
+    """
+    array_axes = [i for i, x in enumerate(subset_idx) if isinstance(x, np.ndarray)]
+    if len(array_axes) != 1:
+        return _subset_numpy_like(a, subset_idx)
+    (axis,) = array_axes
+    idx = subset_idx[axis]
+    # `>=`, not `>`: duplicates keep the axis non-decreasing, which is all the pipeline
+    # asks of it, and re-sorting them would buy nothing.
+    if idx.dtype == bool or idx.size < 2 or bool((idx[1:] >= idx[:-1]).all()):
+        return _subset_numpy_like(a, subset_idx)
+    # Stable, so a repeated index stays a permutation and the inverse below undoes it.
+    order = np.argsort(idx, kind="stable")
+    sorted_idx = list(subset_idx)
+    sorted_idx[axis] = idx[order]
+    out = _subset_numpy_like(a, tuple(sorted_idx))
+    return out[(slice(None),) * axis + (np.argsort(order),)]
 
 
 # Registration for SparseDataset occurs in sparse_dataset.py
