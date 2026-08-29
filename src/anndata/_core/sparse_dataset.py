@@ -889,6 +889,32 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
             else:
                 self.__dict__[name] = zarr.Array(async_array)
 
+    def read_rows(
+        self,
+        rows: np.ndarray,
+        *,
+        out: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read whole rows into buffers the caller owns. Synchronous, no event loop.
+
+        The same read as :meth:`aread_rows` and the same `out` contract, reached without
+        asking the caller to be a coroutine. That matters where it is not a stylistic
+        choice: with ``preload_to_gpu``, annbatch allocates its batch buffers as PINNED
+        host memory (`cupyx.empty_pinned`), and `out` is what lets the decode land in
+        them directly. `__getitem__` returns a fresh pageable array, so the whole batch
+        has to be copied into the pinned buffer afterwards -- a cost that is a rounding
+        error against a CPU-bound batch and is not against a GPU-bound one.
+
+        So the buffer argument is the part worth keeping; being awaitable is not. Callers
+        that want concurrency across datasets can run this on threads, which is what
+        annbatch does.
+
+        Safe to call from any thread EXCEPT one already running zarr's event loop, where
+        the sync bridge would deadlock -- the same rule as every other synchronous read
+        here. Nothing in annbatch runs there once its fetch is threaded.
+        """
+        return zarr_sync(self.aread_rows(rows, out=out))
+
     async def aread_rows(
         self,
         rows: np.ndarray,
