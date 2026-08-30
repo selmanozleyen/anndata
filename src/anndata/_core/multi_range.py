@@ -13,7 +13,16 @@ form, in annbatch -- which is two copies of a workaround for the same missing za
 feature. One copy can at least be fixed once.
 
 None of this would be needed if zarr exposed a public multi-range selection; until it
-does, `zarr.core.indexing.Indexer` is subclassed here and nowhere else in anndata.
+does, `zarr.core.indexing.Indexer` is subclassed here and nowhere else in anndata. That
+is the right eventual home, and annbatch's copy carried the same conclusion as a TODO:
+
+    make this part of the public zarr or zarrs-python API [...] See
+    https://github.com/zarr-developers/zarr-python/issues/3175 for why this is better
+    than simpler alternatives.
+
+Two alternatives named there and worth recording: coalescing chunks in zarrs from an
+integer array, and zarrs supporting integer indexing directly. Both would remove the
+need for the subclass rather than relocate it.
 """
 
 from __future__ import annotations
