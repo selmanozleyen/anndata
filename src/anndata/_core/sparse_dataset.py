@@ -141,6 +141,23 @@ def _read_both_dense(
     )
 
 
+def _ragged_arange(
+    starts: DenseType, lengths: DenseType, xp: ModuleType
+) -> np.ndarray:
+    """``concatenate([arange(s, s + n) for s, n in zip(starts, lengths)])``, vectorised.
+
+    One flat ramp, rebased per run and offset to that run's start, rather than one array
+    per run and a concatenate. The loop form costs a Python iteration and a small
+    allocation per RUN, which is the count that grows: a scattered batch of 1,024 rows is
+    1,024 runs, and the same read at chunk_size 64 is 16.
+    """
+    offsets = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(lengths)])
+    coords = xp.arange(int(offsets[-1]), dtype=xp.int64)
+    coords -= xp.repeat(offsets[:-1], lengths)
+    coords += xp.repeat(starts, lengths)
+    return coords
+
+
 class _RowSelection(NamedTuple):
     """Which part of `data`/`indices` a set of whole rows selects, and where it lands.
 
@@ -201,12 +218,8 @@ def _select_rows(
         take -= xp.repeat(out_indptr[:-1], out_lengths)
         take += xp.repeat(read_offsets[which], out_lengths)
 
-    # A flat ramp, rebased per run and offset to that run's start, rather than one array
-    # per row. Strictly increasing, since `uniq` ascends and `indptr` never decreases.
-    coords = xp.arange(int(read_offsets[-1]), dtype=xp.int64)
-    coords -= xp.repeat(read_offsets[:-1], lengths)
-    coords += xp.repeat(starts, lengths)
-    return _RowSelection(coords, out_indptr, take)
+    # Strictly increasing, since `uniq` ascends and `indptr` never decreases.
+    return _RowSelection(_ragged_arange(starts, lengths, xp), out_indptr, take)
 
 
 def _index_in_memory(
@@ -354,10 +367,16 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         # Flattened to coordinates, which is what upstream does here and what the row
         # read above settled on. A point selection IS a shape the `zarrs` pipeline takes
         # its Rust path for now, so the range form bought only a private-API indexer.
+        #
+        # Built by :func:`_ragged_arange` rather than upstream's concatenate-of-aranges:
+        # same coordinates, but without a Python iteration and an allocation per slice.
         if isinstance(self.data, zarr.Array):
-            coords = self.np_module.concatenate([
-                self.np_module.arange(s.start, s.stop) for s in indptr_limits
-            ])
+            xp = self.np_module
+            limit_starts = xp.array([s.start for s in indptr_limits], dtype=xp.int64)
+            limit_lengths = xp.array(
+                [s.stop - s.start for s in indptr_limits], dtype=xp.int64
+            )
+            coords = _ragged_arange(limit_starts, limit_lengths, xp)
             data, indices = _read_both_dense(self.data, self.indices, coords)
         else:  # hdf5 is synchronous, so a read per range costs no round-trip
             data = np.concatenate([_read_dense(self.data, s) for s in indptr_limits])
