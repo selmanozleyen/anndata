@@ -98,10 +98,29 @@ def _read_dense(
     return arr[idx]
 
 
-_MIN_MEAN_RUN_ROWS = 7
+_MIN_MEAN_RUN_ROWS = 3
 """Rows per contiguous range below which describing a read by element beats describing
-it by range. Shared with :meth:`BackedSparseMatrix.subset_by_major_axis_mask`, which has
-always drawn the line in the same place."""
+it by range.
+
+The two descriptions have different asymptotics, so they cross exactly once. Coordinates
+cost O(nnz) to build and to hand to the store, which makes their throughput flat in
+contiguity -- measured through annbatch on fourteen plates, a coordinate read moves
+17.8M-26.5M nnz/s whether each run is one row or sixty-four. Ranges cost O(runs), so they
+scale with it: the same sweep goes to 111M nnz/s.
+
+Measured directly, sweeping annbatch's `chunk_size` (which IS rows per run) with both
+descriptions forced, 14 plates, compressed, random draw:
+
+    rows/run     1       2       4       8      16      64
+    coords    12,716  13,180  14,721  15,572  17,890  18,919
+    ranges     8,114  12,029  15,161  18,358  22,887  26,435
+
+Coordinates win at 1 and 2, ranges from 4 up, so the line belongs at 3. It was 7, which
+put rows/run 4-7 on the slower branch. An earlier sweep of this constant reached the same
+answer from the other direction and is recorded in the bench notes.
+
+:meth:`BackedSparseMatrix.subset_by_major_axis_mask` shares it, and nothing here has
+measured the mask path -- it is a different selection reaching a different method."""
 
 
 class _MultiRangeIndexer(zarr.core.indexing.Indexer):
@@ -227,6 +246,23 @@ def _read_both_dense(
     )
 
 
+def _ragged_arange(
+    starts: DenseType, lengths: DenseType, xp: ModuleType
+) -> np.ndarray:
+    """``concatenate([arange(s, s + n) for s, n in zip(starts, lengths)])``, vectorised.
+
+    One flat ramp, rebased per run and offset to that run's start, rather than an array
+    per run and a concatenate of them all. The loop form costs a Python iteration and a
+    small allocation per RUN, and the run count is what grows: a scattered batch of 1,024
+    rows is 1,024 runs where the same read at chunk_size 64 is 16.
+    """
+    offsets = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(lengths)])
+    coords = xp.arange(int(offsets[-1]), dtype=xp.int64)
+    coords -= xp.repeat(offsets[:-1], lengths)
+    coords += xp.repeat(starts, lengths)
+    return coords
+
+
 def _coordinate_runs(
     starts: DenseType, lengths: DenseType, xp: ModuleType
 ) -> list[slice] | None:
@@ -312,12 +348,8 @@ def _select_rows(
     if (runs := _coordinate_runs(starts, lengths, xp)) is not None:
         return _RowSelection(None, out_indptr, take, runs)
 
-    # A flat ramp, rebased per run and offset to that run's start, rather than one array
-    # per row. Strictly increasing, since `uniq` ascends and `indptr` never decreases.
-    coords = xp.arange(int(read_offsets[-1]), dtype=xp.int64)
-    coords -= xp.repeat(read_offsets[:-1], lengths)
-    coords += xp.repeat(starts, lengths)
-    return _RowSelection(coords, out_indptr, take, None)
+    # Strictly increasing, since `uniq` ascends and `indptr` never decreases.
+    return _RowSelection(_ragged_arange(starts, lengths, xp), out_indptr, take, None)
 
 
 def _index_in_memory(
