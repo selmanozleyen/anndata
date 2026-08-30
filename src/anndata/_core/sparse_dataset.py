@@ -48,12 +48,9 @@ from .index import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Iterator, Mapping
+    from collections.abc import Mapping
     from types import EllipsisType, ModuleType
     from typing import Any, Literal
-
-    from zarr.core.buffer import BufferPrototype, NDBuffer
-    from zarr.core.common import NDArrayLikeOrScalar
 
     from .._types import _ArrayStorageType, _GroupStorageType
     from ..typing import Index, Index1D
@@ -98,70 +95,6 @@ def _read_dense(
     return arr[idx]
 
 
-_MIN_MEAN_RUN_ROWS = 7
-"""Rows per contiguous range below which describing a read by element beats describing
-it by range. Shared with :meth:`BackedSparseMatrix.subset_by_major_axis_mask`, which has
-always drawn the line in the same place."""
-
-
-class _MultiRangeIndexer(zarr.core.indexing.Indexer):
-    """Several contiguous ranges of a 1-D array, read as ONE selection.
-
-    zarr describes a read as a single selection, so several ranges would otherwise mean
-    several calls, and that per-call overhead grows with the range count -- which is the
-    regime this exists to serve. Chunk projections are re-based onto one output buffer so
-    the ranges land in it back to back, in the order given.
-    """
-
-    def __init__(self, arr: zarr.Array, runs: Sequence[slice]) -> None:
-        # `Array._chunk_grid` since zarr 3.1.7; on the metadata before that.
-        chunk_grid = getattr(arr, "_chunk_grid", None) or arr.metadata.chunk_grid
-        self.indexers = [
-            zarr.core.indexing.BasicIndexer(
-                (run,), shape=arr.metadata.shape, chunk_grid=chunk_grid
-            )
-            for run in runs
-        ]
-        self.shape = (sum(i.shape[0] for i in self.indexers),)
-        self.drop_axes = self.indexers[0].drop_axes
-
-    def __iter__(self) -> Iterator[zarr.core.indexing.ChunkProjection]:
-        at = 0
-        for indexer in self.indexers:
-            for proj in indexer:
-                width = proj.out_selection[0].stop - proj.out_selection[0].start
-                yield type(proj)(
-                    proj.chunk_coords,
-                    proj.chunk_selection,
-                    (slice(at, at + width),),
-                    proj.is_complete_chunk,
-                )
-                at += width
-
-
-def _aread_ranges(
-    arr: zarr.Array,
-    runs: Sequence[slice],
-    *,
-    prototype: BufferPrototype,
-    out: NDBuffer | None = None,
-) -> Coroutine[Any, Any, NDArrayLikeOrScalar]:
-    """Read several contiguous ranges of a zarr array as ONE selection.
-
-    A call per range would instead pay a round-trip onto zarr's event loop each time, and
-    ranges are exactly what there are many of here.
-    """
-    return arr._async_array._get_selection(
-        _MultiRangeIndexer(arr, runs), prototype=prototype, out=out
-    )
-
-
-def _read_ranges(arr: zarr.Array, runs: Sequence[slice]) -> DenseType:
-    """:func:`_aread_ranges` for callers that are not themselves on the event loop."""
-    prototype = zarr.core.buffer.default_buffer_prototype()
-    return zarr_sync(_aread_ranges(arr, runs, prototype=prototype))
-
-
 def _aread_selection(arr: zarr.Array, idx: slice | np.ndarray, *, prototype):
     """``arr[idx]`` as a coroutine, for a slice or an ASCENDING integer array.
 
@@ -188,34 +121,15 @@ async def _agather_pair(first, second):
     return await asyncio.gather(first, second)
 
 
-def _read_both_ranges(
-    first: zarr.Array, second: zarr.Array, runs: Sequence[slice]
+def _read_both_dense(
+    first: zarr.Array, second: zarr.Array, idx: slice | np.ndarray
 ) -> tuple[DenseType, DenseType]:
-    """The same ranges out of two arrays, in ONE trip onto zarr's event loop.
+    """The same selection out of two arrays, in ONE trip onto zarr's event loop.
 
     `data` and `indices` are independent reads of the same rows and were issued back to
     back: two crossings of the sync bridge, and the second could not start until the
     first had finished. Gathered, it is one crossing and they overlap.
-
-    Whether the overlap itself wins depends on whether one read already saturates -- the
-    pipeline's own workers are concurrent within a single call -- but the crossing that
-    goes away does not depend on that.
     """
-    prototype = zarr.core.buffer.default_buffer_prototype()
-    return tuple(
-        zarr_sync(
-            _agather_pair(
-                _aread_ranges(first, runs, prototype=prototype),
-                _aread_ranges(second, runs, prototype=prototype),
-            )
-        )
-    )
-
-
-def _read_both_dense(
-    first: zarr.Array, second: zarr.Array, idx: slice | np.ndarray
-) -> tuple[DenseType, DenseType]:
-    """:func:`_read_both_ranges` for a selection that is not a list of ranges."""
     prototype = zarr.core.buffer.default_buffer_prototype()
     return tuple(
         zarr_sync(
@@ -227,38 +141,20 @@ def _read_both_dense(
     )
 
 
-def _coordinate_runs(
-    starts: DenseType, lengths: DenseType, xp: ModuleType
-) -> list[slice] | None:
-    """The read as contiguous ranges, or None when it is too fragmented to pay for.
-
-    Rows that are neighbours on disk share a boundary, so a batch of them collapses to a
-    handful of ranges. A range is the form a store reads fastest: `zarrs` takes its Rust
-    path only for one, and even zarr-python spends O(1) describing a range where it
-    spends O(nnz) describing the same span point by point.
-
-    Scattered rows are the opposite -- the ranges come to outnumber what they hold, and
-    describing the read by element wins instead.
-    """
-    stops = starts + lengths
-    breaks = xp.flatnonzero(starts[1:] != stops[:-1])
-    if starts.size <= (breaks.size + 1) * _MIN_MEAN_RUN_ROWS:
-        return None
-    firsts = xp.concatenate([xp.zeros(1, dtype=breaks.dtype), breaks + 1])
-    lasts = xp.concatenate([breaks, xp.full(1, starts.size - 1, dtype=breaks.dtype)])
-    return [
-        slice(int(a), int(b)) for a, b in zip(starts[firsts], stops[lasts], strict=True)
-    ]
-
-
 class _RowSelection(NamedTuple):
     """Which part of `data`/`indices` a set of whole rows selects, and where it lands.
 
-    The read is described either as `runs` -- contiguous ranges -- or as `coords`, never
-    both; :func:`_coordinate_runs` picks, and the unused one is not built. Both forms are
-    strictly increasing, which is the only shape a backed read is described efficiently
-    in. Getting there costs a sort of the ROWS -- thousands -- rather than of their
-    coordinates, of which there are millions.
+    The read is described by `coords`, which is strictly increasing -- the only shape a
+    backed read is described efficiently in. Getting there costs a sort of the ROWS --
+    thousands -- rather than of their coordinates, of which there are millions.
+
+    There was a second description, contiguous ranges, chosen when rows-per-run cleared a
+    threshold. It is gone: measured through annbatch across one and fourteen plates,
+    compressed and uncompressed, random and strided, describing a scattered row read by
+    range was 1.36x to 2.18x SLOWER than by coordinate, and slower than upstream too. A
+    scattered draw makes every row its own range, which pays a range's description for a
+    single row -- and the store serves both forms on the same path now, so the range
+    bought nothing back.
 
     Deduplicating is not an optimisation, it is required. A row asked for twice replays
     its coordinate run from the start, so `[3, 3, 10]` yields `50 51 52 50 51 52 90 91`
@@ -266,14 +162,12 @@ class _RowSelection(NamedTuple):
     accepts ordered ranges refuses it.
     """
 
-    coords: np.ndarray | None
-    """Ascending, distinct coordinates into `data`/`indices`, or None if `runs` is set."""
+    coords: np.ndarray
+    """Ascending, distinct coordinates into `data`/`indices`."""
     indptr: np.ndarray
     """Row boundaries of the RESULT, in the caller's order, repeats included."""
     take: np.ndarray | None
     """Gather placing the read into the caller's order, or None if it is already there."""
-    runs: list[slice] | None
-    """Ascending, disjoint ranges of `data`/`indices`, or None if `coords` is set."""
 
 
 def _select_rows(
@@ -307,17 +201,12 @@ def _select_rows(
         take -= xp.repeat(out_indptr[:-1], out_lengths)
         take += xp.repeat(read_offsets[which], out_lengths)
 
-    # Ranges first: when they win, `coords` is never built, and not building it is most
-    # of the point -- it is the one array here whose size is the nnz of the whole batch.
-    if (runs := _coordinate_runs(starts, lengths, xp)) is not None:
-        return _RowSelection(None, out_indptr, take, runs)
-
     # A flat ramp, rebased per run and offset to that run's start, rather than one array
     # per row. Strictly increasing, since `uniq` ascends and `indptr` never decreases.
     coords = xp.arange(int(read_offsets[-1]), dtype=xp.int64)
     coords -= xp.repeat(read_offsets[:-1], lengths)
     coords += xp.repeat(starts, lengths)
-    return _RowSelection(coords, out_indptr, take, None)
+    return _RowSelection(coords, out_indptr, take)
 
 
 def _index_in_memory(
@@ -434,19 +323,12 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         data: DenseType
         indices: DenseType
         # HDF5 cannot handle out-of-order integer indexing, so it reads a slice per row
-        # instead; zarr takes the whole selection at once, as whichever of ranges or
-        # ordered coordinates `_select_rows` found cheaper.
+        # instead; zarr takes the whole selection at once, as the ordered coordinates
+        # `_select_rows` derives.
         if isinstance(self.data, zarr.Array):
             xp = self.np_module
             selection = _select_rows(xp.asarray(row_idxs), self.indptr, xp)
-            if selection.runs is not None:
-                data, indices = _read_both_ranges(
-                    self.data, self.indices, selection.runs
-                )
-            else:
-                data, indices = _read_both_dense(
-                    self.data, self.indices, selection.coords
-                )
+            data, indices = _read_both_dense(self.data, self.indices, selection.coords)
             if selection.take is not None:
                 data, indices = data[selection.take], indices[selection.take]
             return CompressedVectors.from_buffers(data, indices, selection.indptr)
@@ -469,12 +351,14 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         indptr_limits = [slice(i[0].item(), i[-1].item()) for i in indptr_indices]
         data: DenseType
         indices: DenseType
-        # `indptr_limits` already ARE the contiguous ranges of the read, so they are read
-        # as ranges. Flattening them into one point-per-element array -- which zarr used
-        # to do here -- describes the same bytes in O(nnz) rather than O(slices), and a
-        # point selection is not a shape the `zarrs` pipeline can take its Rust path for.
+        # Flattened to coordinates, which is what upstream does here and what the row
+        # read above settled on. A point selection IS a shape the `zarrs` pipeline takes
+        # its Rust path for now, so the range form bought only a private-API indexer.
         if isinstance(self.data, zarr.Array):
-            data, indices = _read_both_ranges(self.data, self.indices, indptr_limits)
+            coords = self.np_module.concatenate([
+                self.np_module.arange(s.start, s.stop) for s in indptr_limits
+            ])
+            data, indices = _read_both_dense(self.data, self.indices, coords)
         else:  # hdf5 is synchronous, so a read per range costs no round-trip
             data = np.concatenate([_read_dense(self.data, s) for s in indptr_limits])
             indices = np.concatenate([
@@ -582,7 +466,7 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
 
         # heuristic for whether slicing should be optimized
         if len(slices) > 0:
-            if mean_slice_length(slices) <= _MIN_MEAN_RUN_ROWS:
+            if mean_slice_length(slices) <= 7:
                 return self.get_compressed_vectors(np.where(mask)[0])
             else:
                 return self.get_compressed_vectors_for_slices(slices)
@@ -983,10 +867,6 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         # `indices` is not the small half: as uint16 it compresses far less than float32
         # `data`, so on disk it is frequently the larger of the two.
         def read(arr, target):
-            if selection.runs is not None:
-                return _aread_ranges(
-                    arr, selection.runs, prototype=prototype, out=target
-                )
             return arr._async_array.get_coordinate_selection(
                 selection.coords, out=target, prototype=prototype
             )
