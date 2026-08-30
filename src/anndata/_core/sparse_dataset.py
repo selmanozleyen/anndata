@@ -46,14 +46,13 @@ from .index import (
     _subset_dispatch,
     unpack_index,
 )
+from .multi_range import aread_ranges as _aread_ranges
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Iterator, Mapping
+    from collections.abc import Mapping
     from types import EllipsisType, ModuleType
     from typing import Any, Literal
 
-    from zarr.core.buffer import BufferPrototype, NDBuffer
-    from zarr.core.common import NDArrayLikeOrScalar
 
     from .._types import _ArrayStorageType, _GroupStorageType
     from ..typing import Index, Index1D
@@ -122,64 +121,6 @@ answer from the other direction and is recorded in the bench notes.
 This is the ROW read's line only. :meth:`BackedSparseMatrix.subset_by_major_axis_mask`
 draws its own at upstream's 7: it is a different selection reaching a different method,
 and nothing here has measured it."""
-
-
-class _MultiRangeIndexer(zarr.core.indexing.Indexer):
-    """Several contiguous ranges of a 1-D array, read as ONE selection.
-
-    zarr describes a read as a single selection, so several ranges would otherwise mean
-    several calls, and that per-call overhead grows with the range count -- which is the
-    regime this exists to serve. Chunk projections are re-based onto one output buffer so
-    the ranges land in it back to back, in the order given.
-    """
-
-    def __init__(self, arr: zarr.Array, runs: Sequence[slice]) -> None:
-        # `Array._chunk_grid` since zarr 3.1.7; on the metadata before that.
-        chunk_grid = getattr(arr, "_chunk_grid", None) or arr.metadata.chunk_grid
-        self.indexers = [
-            zarr.core.indexing.BasicIndexer(
-                (run,), shape=arr.metadata.shape, chunk_grid=chunk_grid
-            )
-            for run in runs
-        ]
-        self.shape = (sum(i.shape[0] for i in self.indexers),)
-        self.drop_axes = self.indexers[0].drop_axes
-
-    def __iter__(self) -> Iterator[zarr.core.indexing.ChunkProjection]:
-        at = 0
-        for indexer in self.indexers:
-            for proj in indexer:
-                width = proj.out_selection[0].stop - proj.out_selection[0].start
-                yield type(proj)(
-                    proj.chunk_coords,
-                    proj.chunk_selection,
-                    (slice(at, at + width),),
-                    proj.is_complete_chunk,
-                )
-                at += width
-
-
-def _aread_ranges(
-    arr: zarr.Array,
-    runs: Sequence[slice],
-    *,
-    prototype: BufferPrototype,
-    out: NDBuffer | None = None,
-) -> Coroutine[Any, Any, NDArrayLikeOrScalar]:
-    """Read several contiguous ranges of a zarr array as ONE selection.
-
-    A call per range would instead pay a round-trip onto zarr's event loop each time, and
-    ranges are exactly what there are many of here.
-    """
-    return arr._async_array._get_selection(
-        _MultiRangeIndexer(arr, runs), prototype=prototype, out=out
-    )
-
-
-def _read_ranges(arr: zarr.Array, runs: Sequence[slice]) -> DenseType:
-    """:func:`_aread_ranges` for callers that are not themselves on the event loop."""
-    prototype = zarr.core.buffer.default_buffer_prototype()
-    return zarr_sync(_aread_ranges(arr, runs, prototype=prototype))
 
 
 def _aread_selection(arr: zarr.Array, idx: slice | np.ndarray, *, prototype):
