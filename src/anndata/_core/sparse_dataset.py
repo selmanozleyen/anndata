@@ -13,6 +13,7 @@ See the copyright and license note in this directory source code.
 from __future__ import annotations
 
 import asyncio
+import os
 from abc import ABC
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -97,9 +98,15 @@ def _read_dense(
     return arr[idx]
 
 
-_MIN_MEAN_RUN_ROWS = 3
+_MIN_MEAN_RUN_ROWS = int(os.environ.get("ANNDATA_MIN_MEAN_RUN_ROWS", "3"))
 """Rows per contiguous range below which describing a read by element beats describing
 it by range.
+
+BENCH ONLY: read from `ANNDATA_MIN_MEAN_RUN_ROWS` so a sweep can move the line without a
+rebuild. The gate is `rows <= runs * g -> coords`, so **g=0 forces ranges** and a large g
+forces coordinates. g=1 does NOT force ranges: a scattered draw has runs == rows, so
+`rows <= rows` holds and g=1 lands on coordinates beside g=1,000,000. That mistake produced
+a clean 1.000x null result once already.
 
 The two descriptions have different asymptotics, so they cross exactly once. Coordinates
 cost O(nnz) to build and to hand to the store, which makes their throughput flat in
