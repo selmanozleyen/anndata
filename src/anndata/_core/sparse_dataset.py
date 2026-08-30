@@ -119,8 +119,9 @@ Coordinates win at 1 and 2, ranges from 4 up, so the line belongs at 3. It was 7
 put rows/run 4-7 on the slower branch. An earlier sweep of this constant reached the same
 answer from the other direction and is recorded in the bench notes.
 
-:meth:`BackedSparseMatrix.subset_by_major_axis_mask` shares it, and nothing here has
-measured the mask path -- it is a different selection reaching a different method."""
+This is the ROW read's line only. :meth:`BackedSparseMatrix.subset_by_major_axis_mask`
+draws its own at upstream's 7: it is a different selection reaching a different method,
+and nothing here has measured it."""
 
 
 class _MultiRangeIndexer(zarr.core.indexing.Indexer):
@@ -614,7 +615,11 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
 
         # heuristic for whether slicing should be optimized
         if len(slices) > 0:
-            if mean_slice_length(slices) <= _MIN_MEAN_RUN_ROWS:
+            # Upstream's own line, deliberately NOT _MIN_MEAN_RUN_ROWS. This is a
+            # different selection reaching a different method, and nothing here has
+            # measured it; sharing the constant made retuning the row read silently
+            # retune this too, which `test_consecutive_bool[alternating_5]` caught.
+            if mean_slice_length(slices) <= 7:
                 return self.get_compressed_vectors(np.where(mask)[0])
             else:
                 return self.get_compressed_vectors_for_slices(slices)
