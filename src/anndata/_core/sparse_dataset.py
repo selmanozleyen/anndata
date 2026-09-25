@@ -97,7 +97,7 @@ def _read_dense(
     return arr[idx]
 
 
-_MIN_MEAN_RUN_ROWS = 3
+_MIN_MEAN_RUN_ROWS = 0
 """Rows per contiguous range below which describing a read by element beats describing
 it by range.
 
