@@ -277,9 +277,9 @@ class _RowSelection(NamedTuple):
     runs: list[slice] | None
     """Ascending, disjoint ranges of `data`/`indices`, or None if `coords` is set."""
     starts: np.ndarray | None = None
-    """Where each distinct row starts in `data`/`indices`, ascending; set when undescribed."""
+    """Where each requested row starts, in the caller's order; set when undescribed."""
     lengths: np.ndarray | None = None
-    """Each distinct row's length, alongside `starts`."""
+    """Each requested row's length, alongside `starts`."""
 
 
 def _select_rows(
@@ -291,9 +291,15 @@ def _select_rows(
 ) -> _RowSelection:
     """Derive the read for whole `rows`, in any order, repeats allowed.
 
-    `describe=False` returns the rows' `starts` and `lengths` instead of `runs` or `coords`,
-    for a store that takes ranges directly.
+    `describe=False` returns each requested row's `starts` and `lengths`, in the caller's
+    order and repeats included, for a store that takes ranges directly: the read then lands
+    in order, so nothing is sorted, deduplicated or gathered afterwards.
     """
+    if not describe:
+        starts = _read_dense(indptr, rows)
+        lengths = _read_dense(indptr, rows + 1) - starts
+        out_indptr = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(lengths)])
+        return _RowSelection(None, out_indptr, None, None, starts, lengths)
     # Distinct rows ascending, plus the map from each requested position to one of them.
     order = xp.argsort(rows, kind="stable")
     ordered = rows[order]
@@ -321,8 +327,6 @@ def _select_rows(
         take -= xp.repeat(out_indptr[:-1], out_lengths)
         take += xp.repeat(read_offsets[which], out_lengths)
 
-    if not describe:
-        return _RowSelection(None, out_indptr, take, None, starts, lengths)
     # Ranges first: when they win, `coords` is never built, and not building it is most
     # of the point -- it is the one array here whose size is the nnz of the whole batch.
     if (runs := _coordinate_runs(starts, lengths, xp)) is not None:
