@@ -48,6 +48,12 @@ from .index import (
 )
 from .multi_range import aread_ranges as _aread_ranges
 
+try:
+    from zarrs import UnsupportedRangeReadError as _UnsupportedRangeRead
+    from zarrs import aread_ranges as _zarrs_aread_ranges
+except ImportError:  # no zarrs, or one without range reads
+    _zarrs_aread_ranges = None
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from types import EllipsisType, ModuleType
@@ -229,6 +235,24 @@ def _coordinate_runs(
     ]
 
 
+def _place_rows(
+    data: np.ndarray,
+    indices: np.ndarray,
+    selection: _RowSelection,
+    out: tuple[np.ndarray, np.ndarray] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Put a read of distinct ascending rows into the caller's order, and `out` if given."""
+    if selection.take is None:
+        if out is not None:
+            data, indices = out
+        return data, indices, selection.indptr
+    if out is None:
+        return data[selection.take], indices[selection.take], selection.indptr
+    np.take(data, selection.take, out=out[0])
+    np.take(indices, selection.take, out=out[1])
+    return out[0], out[1], selection.indptr
+
+
 class _RowSelection(NamedTuple):
     """Which part of `data`/`indices` a set of whole rows selects, and where it lands.
 
@@ -252,12 +276,24 @@ class _RowSelection(NamedTuple):
     """Gather placing the read into the caller's order, or None if it is already there."""
     runs: list[slice] | None
     """Ascending, disjoint ranges of `data`/`indices`, or None if `coords` is set."""
+    starts: np.ndarray | None = None
+    """Where each distinct row starts in `data`/`indices`, ascending; set when undescribed."""
+    lengths: np.ndarray | None = None
+    """Each distinct row's length, alongside `starts`."""
 
 
 def _select_rows(
-    rows: np.ndarray, indptr: DenseType | _ArrayStorageType, xp: ModuleType = np
+    rows: np.ndarray,
+    indptr: DenseType | _ArrayStorageType,
+    xp: ModuleType = np,
+    *,
+    describe: bool = True,
 ) -> _RowSelection:
-    """Derive the read for whole `rows`, in any order, repeats allowed."""
+    """Derive the read for whole `rows`, in any order, repeats allowed.
+
+    `describe=False` returns the rows' `starts` and `lengths` instead of `runs` or `coords`,
+    for a store that takes ranges directly.
+    """
     # Distinct rows ascending, plus the map from each requested position to one of them.
     order = xp.argsort(rows, kind="stable")
     ordered = rows[order]
@@ -285,6 +321,8 @@ def _select_rows(
         take -= xp.repeat(out_indptr[:-1], out_lengths)
         take += xp.repeat(read_offsets[which], out_lengths)
 
+    if not describe:
+        return _RowSelection(None, out_indptr, take, None, starts, lengths)
     # Ranges first: when they win, `coords` is never built, and not building it is most
     # of the point -- it is the one array here whose size is the nnz of the whole batch.
     if (runs := _coordinate_runs(starts, lengths, xp)) is not None:
@@ -946,6 +984,32 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         indptr = self._indptr
         if isinstance(indptr, zarr.Array):
             indptr = await indptr._async_array.getitem(Ellipsis)
+
+        # zarrs reads the rows as ranges, per row rather than per element; anything else
+        # it refuses before reading, and the description below serves it.
+        fits = out is None or all(
+            o.dtype == a.dtype and o.flags.c_contiguous
+            for o, a in zip(out, (data_arr, indices_arr), strict=True)
+        )
+        if _zarrs_aread_ranges is not None and fits:
+            ranged = _select_rows(rows, indptr, describe=False)
+            direct = out is not None and ranged.take is None
+            reads = []
+            try:
+                for i, arr in enumerate((data_arr, indices_arr)):
+                    target = out[i] if direct else None
+                    reads.append(
+                        _zarrs_aread_ranges(
+                            arr, ranged.starts, ranged.lengths, out=target
+                        )
+                    )
+            except _UnsupportedRangeRead:
+                for read in reads:
+                    read.close()
+            else:
+                data, indices = await asyncio.gather(*reads)
+                return _place_rows(data, indices, ranged, out)
+
         selection = _select_rows(rows, indptr)
 
         prototype = zarr.core.buffer.default_buffer_prototype()
@@ -972,15 +1036,7 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         data, indices = await asyncio.gather(
             read(data_arr, targets[0]), read(indices_arr, targets[1])
         )
-        if selection.take is None:
-            if out is not None:
-                data, indices = out
-            return data, indices, selection.indptr
-        if out is None:
-            return data[selection.take], indices[selection.take], selection.indptr
-        np.take(data, selection.take, out=out[0])
-        np.take(indices, selection.take, out=out[1])
-        return out[0], out[1], selection.indptr
+        return _place_rows(data, indices, selection, out)
 
     def _to_backed(self) -> BackedSparseMatrix:
         mtx = BackedSparseMatrix(
