@@ -48,12 +48,6 @@ from .index import (
 )
 from .multi_range import aread_ranges as _aread_ranges
 
-try:
-    from zarrs import UnsupportedRangeReadError as _UnsupportedRangeRead
-    from zarrs import aread_ranges as _zarrs_aread_ranges
-except ImportError:  # no zarrs, or one without range reads
-    _zarrs_aread_ranges = None
-
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from types import EllipsisType, ModuleType
@@ -989,30 +983,24 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         if isinstance(indptr, zarr.Array):
             indptr = await indptr._async_array.getitem(Ellipsis)
 
-        # zarrs reads the rows as ranges, per row rather than per element; anything else
-        # it refuses before reading, and the description below serves it.
-        fits = out is None or all(
-            o.dtype == a.dtype and o.flags.c_contiguous
-            for o, a in zip(out, (data_arr, indices_arr), strict=True)
-        )
-        if _zarrs_aread_ranges is not None and fits:
+        # Each row is one range of `data`/`indices`, so a zarr with a range selection reads the
+        # rows as asked, per row rather than per element; its codec pipeline may serve that
+        # directly. Without one, the description below serves it.
+        if hasattr(data_arr._async_array, "get_range_selection"):
             ranged = _select_rows(rows, indptr, describe=False)
-            direct = out is not None and ranged.take is None
-            reads = []
-            try:
-                for i, arr in enumerate((data_arr, indices_arr)):
-                    target = out[i] if direct else None
-                    reads.append(
-                        _zarrs_aread_ranges(
-                            arr, ranged.starts, ranged.lengths, out=target
-                        )
+            prototype = zarr.core.buffer.default_buffer_prototype()
+            targets = (None, None)
+            if out is not None:
+                targets = (prototype.nd_buffer(out[0]), prototype.nd_buffer(out[1]))
+            data, indices = await asyncio.gather(
+                *(
+                    arr._async_array.get_range_selection(
+                        ranged.starts, ranged.lengths, out=target, prototype=prototype
                     )
-            except _UnsupportedRangeRead:
-                for read in reads:
-                    read.close()
-            else:
-                data, indices = await asyncio.gather(*reads)
-                return _place_rows(data, indices, ranged, out)
+                    for arr, target in zip((data_arr, indices_arr), targets, strict=True)
+                )
+            )
+            return _place_rows(data, indices, ranged, out)
 
         selection = _select_rows(rows, indptr)
 
