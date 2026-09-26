@@ -229,6 +229,40 @@ def _coordinate_runs(
     ]
 
 
+async def _read_row_ranges(
+    data_arr: zarr.Array,
+    indices_arr: zarr.Array,
+    indptr: np.ndarray,
+    starts: np.ndarray,
+    lengths: np.ndarray,
+    out: tuple[np.ndarray, np.ndarray] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Runs of rows read as one element range each, through zarr's range selection."""
+    stops = starts + lengths
+    elem_starts = np.asarray(indptr[starts], dtype=np.int64)
+    elem_lengths = np.asarray(indptr[stops], dtype=np.int64) - elem_starts
+    # The result's indptr is each run's own, rebased and laid end to end.
+    rows = _ragged_arange(starts, lengths, np)
+    out_indptr = np.zeros(rows.size + 1, dtype=np.int64)
+    np.cumsum(indptr[rows + 1] - indptr[rows], out=out_indptr[1:])
+    prototype = zarr.core.buffer.default_buffer_prototype()
+    targets = (None, None)
+    if out is not None:
+        targets = (prototype.nd_buffer(out[0]), prototype.nd_buffer(out[1]))
+    # `data` and `indices` are equally long reads of different arrays: at once, not in turn.
+    data, indices = await asyncio.gather(
+        *(
+            arr._async_array.get_range_selection(
+                elem_starts, elem_lengths, out=target, prototype=prototype
+            )
+            for arr, target in zip((data_arr, indices_arr), targets, strict=True)
+        )
+    )
+    if out is not None:
+        data, indices = out
+    return data, indices, out_indptr
+
+
 def _place_rows(
     data: np.ndarray,
     indices: np.ndarray,
@@ -270,30 +304,12 @@ class _RowSelection(NamedTuple):
     """Gather placing the read into the caller's order, or None if it is already there."""
     runs: list[slice] | None
     """Ascending, disjoint ranges of `data`/`indices`, or None if `coords` is set."""
-    starts: np.ndarray | None = None
-    """Where each requested row starts, in the caller's order; set when undescribed."""
-    lengths: np.ndarray | None = None
-    """Each requested row's length, alongside `starts`."""
 
 
 def _select_rows(
-    rows: np.ndarray,
-    indptr: DenseType | _ArrayStorageType,
-    xp: ModuleType = np,
-    *,
-    describe: bool = True,
+    rows: np.ndarray, indptr: DenseType | _ArrayStorageType, xp: ModuleType = np
 ) -> _RowSelection:
-    """Derive the read for whole `rows`, in any order, repeats allowed.
-
-    `describe=False` returns each requested row's `starts` and `lengths`, in the caller's
-    order and repeats included, for a store that takes ranges directly: the read then lands
-    in order, so nothing is sorted, deduplicated or gathered afterwards.
-    """
-    if not describe:
-        starts = _read_dense(indptr, rows)
-        lengths = _read_dense(indptr, rows + 1) - starts
-        out_indptr = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(lengths)])
-        return _RowSelection(None, out_indptr, None, None, starts, lengths)
+    """Derive the read for whole `rows`, in any order, repeats allowed."""
     # Distinct rows ascending, plus the map from each requested position to one of them.
     order = xp.argsort(rows, kind="stable")
     ordered = rows[order]
@@ -446,6 +462,10 @@ class BackedSparseMatrix[ArrayT: _ArrayStorageType]:
         # HDF5 cannot handle out-of-order integer indexing, so it reads a slice per row
         # instead; zarr takes the whole selection at once, as whichever of ranges or
         # ordered coordinates `_select_rows` found cheaper.
+        if isinstance(self.data, zarr.Array) and hasattr(self.data, "get_range_selection"):
+            rows = np.asarray(row_idxs)
+            data, indices, indptr = self.read_row_ranges(rows, np.ones_like(rows))
+            return CompressedVectors.from_buffers(data, indices, indptr)
         if isinstance(self.data, zarr.Array):
             xp = self.np_module
             selection = _select_rows(xp.asarray(row_idxs), self.indptr, xp)
@@ -983,24 +1003,12 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
         if isinstance(indptr, zarr.Array):
             indptr = await indptr._async_array.getitem(Ellipsis)
 
-        # Each row is one range of `data`/`indices`, so a zarr with a range selection reads the
-        # rows as asked, per row rather than per element; its codec pipeline may serve that
-        # directly. Without one, the description below serves it.
+        # A zarr with a range selection reads each row as one range, as asked: no sort, no
+        # description per element, and its codec pipeline may serve it directly.
         if hasattr(data_arr._async_array, "get_range_selection"):
-            ranged = _select_rows(rows, indptr, describe=False)
-            prototype = zarr.core.buffer.default_buffer_prototype()
-            targets = (None, None)
-            if out is not None:
-                targets = (prototype.nd_buffer(out[0]), prototype.nd_buffer(out[1]))
-            data, indices = await asyncio.gather(
-                *(
-                    arr._async_array.get_range_selection(
-                        ranged.starts, ranged.lengths, out=target, prototype=prototype
-                    )
-                    for arr, target in zip((data_arr, indices_arr), targets, strict=True)
-                )
+            return await _read_row_ranges(
+                data_arr, indices_arr, indptr, rows, np.ones_like(rows), out
             )
-            return _place_rows(data, indices, ranged, out)
 
         selection = _select_rows(rows, indptr)
 
@@ -1029,6 +1037,49 @@ class BaseCompressedSparseDataset[GroupT: _GroupStorageType](
             read(data_arr, targets[0]), read(indices_arr, targets[1])
         )
         return _place_rows(data, indices, selection, out)
+
+    def read_row_ranges(
+        self,
+        starts: np.ndarray,
+        lengths: np.ndarray,
+        *,
+        out: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """:meth:`aread_row_ranges` for callers that are not on zarr's event loop."""
+        return zarr_sync(self.aread_row_ranges(starts, lengths, out=out))
+
+    async def aread_row_ranges(
+        self,
+        starts: np.ndarray,
+        lengths: np.ndarray,
+        *,
+        out: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read runs of whole rows, ``starts[i] : starts[i] + lengths[i]``, back to back.
+
+        A run of rows is one range of `data` and `indices`, so this reads one range per run,
+        where :meth:`aread_rows` of the same rows reads one per row. Runs may repeat,
+        overlap and come in any order; the result is in the order given. `out` is as in
+        :meth:`aread_rows`. Without a zarr range selection it reads the runs' rows.
+        """
+        if self.format != "csr":
+            msg = f"aread_row_ranges reads whole rows, so it is csr-only, not {self.format}"
+            raise NotImplementedError(msg)
+        await self._aresolve()
+        data_arr, indices_arr = self._data, self._indices
+        starts = np.asarray(starts, dtype=np.int64)
+        lengths = np.asarray(lengths, dtype=np.int64)
+        if not (
+            isinstance(data_arr, zarr.Array)
+            and hasattr(data_arr._async_array, "get_range_selection")
+        ):
+            return await self.aread_rows(_ragged_arange(starts, lengths, np), out=out)
+        indptr = self._indptr  # as in `aread_rows`: never the synchronous read
+        if isinstance(indptr, zarr.Array):
+            indptr = await indptr._async_array.getitem(Ellipsis)
+        return await _read_row_ranges(
+            data_arr, indices_arr, indptr, starts, lengths, out
+        )
 
     def _to_backed(self) -> BackedSparseMatrix:
         mtx = BackedSparseMatrix(
