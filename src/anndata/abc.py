@@ -35,11 +35,7 @@ class _AbstractCSDataset(ABC):
     @property
     @abstractmethod
     def indices_dtype(self) -> np.dtype:
-        """The :class:`numpy.dtype` of the `indices` attribute of the sparse matrix.
-
-        With :attr:`dtype` and :attr:`indptr`, this is everything needed to size a read
-        before making it.
-        """
+        """The :class:`numpy.dtype` of the `indices` attribute of the sparse matrix."""
 
     @property
     @abstractmethod
@@ -54,12 +50,7 @@ class _AbstractCSDataset(ABC):
     @property
     @abstractmethod
     def indptr(self) -> np.ndarray:
-        """Boundaries of the vectors along the major axis.
-
-        Public because sizing a read needs it before the read happens: a caller
-        preallocating one buffer across several datasets has to know each one's nnz up
-        front. Normally cached on first access, so free thereafter.
-        """
+        """The major axis boundaries of the backed matrix, in memory."""
 
     @abstractmethod
     def __getitem__(self, index: Index) -> float | CSMatrix | CSArray:
@@ -131,26 +122,15 @@ class CSRDataset(_AbstractCSDataset, ABC):
     async def aread_rows(
         self, rows: np.ndarray, *, out: tuple[np.ndarray, np.ndarray] | None = None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read whole rows, concurrently, optionally into buffers the caller owns.
-
-        The same read as ``self[rows]``, but awaitable. zarr runs a single shared event
-        loop, so the synchronous form deadlocks if called from inside a coroutine
-        already running on it: a caller gathering reads across several datasets cannot
-        use `__getitem__` at all, and can await this one alongside the rest of its work.
-
-        Rows are read once each and ascending, whatever order was asked for, because a
-        backed read is only described efficiently as ordered contiguous ranges. The
-        result is still in the caller's order, repeats included.
+        """Read whole rows, in the order given, from inside zarr's event loop.
 
         Parameters
         ----------
         rows
             Row indices, in any order, repeats allowed.
         out
-            ``(data, indices)`` buffers to read into, each as long as the total nnz of
-            `rows` -- sized by the caller from :attr:`indptr`. The read lands in them
-            directly when `rows` is already ascending and distinct, and is placed into
-            them otherwise.
+            ``(data, indices)`` buffers as long as the total nnz of `rows`, filled in
+            place.
 
         Returns
         -------
